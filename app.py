@@ -464,58 +464,112 @@ def render_pdf(team,people,days,exceptions,holidays,year,month):
  c.drawRightString(W-margin,10,'Emissão: '+datetime.now().strftime('%d/%m/%Y %H:%M'))
  c.showPage();c.save();return buf.getvalue()
 
-def render_pdf_from_dataframe(title,df,year,month):
- """Exporta exatamente as células e a ordem da escala visível, sem recalcular turnos."""
- from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,PageBreak,Spacer,KeepTogether
- from reportlab.lib.pagesizes import A3,landscape
- from reportlab.lib.styles import ParagraphStyle
+def render_pdf_from_dataframe(title, df, year, month, page_choice='auto'):
+ """PDF A4 paisagem, 1 ou 2 páginas, sem cortar o conteúdo das células."""
+ from reportlab.pdfgen import canvas
+ from reportlab.lib.pagesizes import A4, landscape
  from reportlab.lib.colors import HexColor
- from reportlab.lib.enums import TA_CENTER
- from xml.sax.saxutils import escape
- buf=io.BytesIO(); page_w,page_h=landscape(A3)
- head=ParagraphStyle('gds_head',fontName='Helvetica-Bold',fontSize=8.3,leading=11.5,alignment=TA_CENTER,splitLongWords=True)
- cell=ParagraphStyle('gds_cell',fontName='Helvetica',fontSize=7.4,leading=10,alignment=TA_CENTER)
- title_style=ParagraphStyle('gds_title',fontName='Helvetica-Bold',fontSize=14,leading=18)
- subtitle=ParagraphStyle('gds_subtitle',fontName='Helvetica',fontSize=9,leading=12)
- doc=SimpleDocTemplate(buf,pagesize=(page_w,page_h),leftMargin=26,rightMargin=26,topMargin=25,bottomMargin=25)
- cols_all=list(df.columns); names=cols_all[2:]
- if not names:raise ValueError('A escala não possui colaboradores para exportar.')
- # Distribuição equilibrada: para 15 pessoas, 3 páginas com 5, sem página isolada.
- count=(len(names)+5)//6
- per_page=(len(names)+count-1)//count
- groups=[names[i:i+per_page] for i in range(0,len(names),per_page)]
- story=[]
- for page_no,people_cols in enumerate(groups,1):
-  if page_no>1:story.append(PageBreak())
-  cols=cols_all[:2]+people_cols
-  story.append(Paragraph(escape(title.upper()),title_style))
-  story.append(Paragraph(escape(f'{MONTHS[month-1].upper()} / {year}  |  Página {page_no} de {len(groups)}  |  Colaboradores {1+(page_no-1)*per_page} a {(page_no-1)*per_page+len(people_cols)}'),subtitle))
-  story.append(Spacer(1,12))
-  def h(v):
-   # Quebra por palavras: nome completo em 2–4 linhas legíveis.
-   words=escape(str(v)).split(' ')
-   lines=[];line=[]
-   for w in words:
-    if sum(map(len,line))+len(line)+len(w)>17 and line:
-     lines.append(' '.join(line));line=[]
-    line.append(w)
-   if line:lines.append(' '.join(line))
-   return Paragraph('<br/>'.join(lines),head)
-  data=[[h(c) for c in cols]]
-  for _,row in df.iterrows():
-   data.append([Paragraph(escape('' if pd.isna(row[c]) else str(row[c])).replace(' | ','<br/>'),cell) for c in cols])
-  usable=page_w-52
-  widths=[74,100]+[(usable-174)/len(people_cols)]*len(people_cols)
-  t=Table(data,colWidths=widths,repeatRows=1,hAlign='LEFT')
-  cmds=[('BACKGROUND',(0,0),(-1,0),HexColor('#292929')),('TEXTCOLOR',(0,0),(-1,0),HexColor('#ffffff')),('GRID',(0,0),(-1,-1),.35,HexColor('#c5c8cc')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,0),8),('BOTTOMPADDING',(0,0),(-1,0),8),('TOPPADDING',(0,1),(-1,-1),4),('BOTTOMPADDING',(0,1),(-1,-1),4)]
-  for i in range(1,len(data)):
-   if i%2==0:cmds.append(('BACKGROUND',(0,i),(-1,i),HexColor('#f3f4f6')))
-   if 'Feriado' in str(df.iloc[i-1]['Dia']):cmds.append(('BACKGROUND',(0,i),(1,i),HexColor('#ffe1be')))
-   for j,col in enumerate(people_cols,2):
-    if str(df.iloc[i-1][col]).strip().upper().startswith('FOLGA'):cmds.append(('BACKGROUND',(j,i),(j,i),HexColor('#c9ebc2')))
-  t.setStyle(TableStyle(cmds));story.append(t)
- doc.build(story)
- return buf.getvalue()
+ from reportlab.pdfbase.pdfmetrics import stringWidth
+ from xml.sax.saxutils import unescape
+ import math
+ buf=io.BytesIO(); W,H=landscape(A4)
+ names=list(df.columns[2:]); n=len(names)
+ if not n: raise ValueError('A escala não possui colaboradores para exportar.')
+ if page_choice not in ('auto','1','2'):page_choice='auto'
+ # Uma página: somente se a fonte ficar legível. Duas: divisão equilibrada.
+ one_width=(W-24-94-60)/n
+ page_count=(1 if one_width>=37 else 2) if page_choice=='auto' else int(page_choice)
+ page_count=min(page_count,n)
+ per_page=math.ceil(n/page_count)
+ groups=[names[i:i+per_page] for i in range(0,n,per_page)]
+ c=canvas.Canvas(buf,pagesize=(W,H))
+ def compact_name(name, width, font):
+  words=str(name).split()
+  # Preservar identificação por nome e sobrenome, sem cortes horizontais.
+  candidates=[' '.join(words), ' '.join(words[:2]+words[-1:]) if len(words)>3 else ' '.join(words), ' '.join(words[:2]) if len(words)>1 else str(name)]
+  for candidate in candidates:
+   if stringWidth(candidate,'Helvetica-Bold',font)<=width:return candidate
+  candidate=candidates[-1]
+  while candidate and stringWidth(candidate+'…','Helvetica-Bold',font)>width:candidate=candidate[:-1]
+  return candidate+'…'
+ def draw_wrapped(text,x,y,width,font,maxlines=2,bold=False):
+  fontname='Helvetica-Bold' if bold else 'Helvetica'
+  text=str(text or '').replace(' | ',' / ').replace('–','-')
+  if not text:return
+  words=text.split();lines=[];line=''
+  for word in words:
+   trial=(line+' '+word).strip()
+   if stringWidth(trial,fontname,font)<=width:line=trial
+   else:
+    if line:lines.append(line)
+    line=word
+  if line:lines.append(line)
+  if len(lines)>maxlines:
+   lines=lines[:maxlines]
+   last=lines[-1]
+   while last and stringWidth(last+'...',fontname,font)>width:last=last[:-1]
+   lines[-1]=last+'...'
+  c.setFont(fontname,font)
+  for k,line in enumerate(lines):c.drawCentredString(x,y-k*(font+1.1),line)
+ for page_i,people in enumerate(groups):
+  m=12; x0=m; ytop=H-47; ybottom=19
+  available=W-2*m; date_w=58;day_w=70
+  person_w=(available-date_w-day_w)/len(people)
+  row_h=(ytop-ybottom-34)/(len(df)+1)
+  header_h=34; body_top=ytop-header_h
+  cell_font=min(7.3,max(4.0,person_w/9.2))
+  header_font=min(8.0,max(5.1,person_w/8.8))
+  c.setFillColor(HexColor('#F58232'));c.rect(0,H-41,W,41,fill=1,stroke=0)
+  c.setFillColor(HexColor('#FFFFFF'));c.setFont('Helvetica-Bold',13)
+  c.drawString(m,H-19,str(title).upper()[:85])
+  c.setFont('Helvetica',8);c.drawString(m,H-33,f'{MONTHS[month-1].upper()} / {year}  •  A4 PAISAGEM  •  FOLHA {page_i+1}/{len(groups)}')
+  xs=[x0,x0+date_w,x0+date_w+day_w]+[x0+date_w+day_w+(i+1)*person_w for i in range(len(people))]
+  c.setFillColor(HexColor('#F9C69D'));c.rect(x0,body_top,available,header_h,fill=1,stroke=0)
+  c.setFillColor(HexColor('#232323'))
+  draw_wrapped('DATA',(xs[0]+xs[1])/2,body_top+19,date_w-4,7,1,True)
+  draw_wrapped('DIA',(xs[1]+xs[2])/2,body_top+19,day_w-4,7,1,True)
+  for j,name in enumerate(people):
+   words=str(name).split();full=' '.join(words)
+   # Distribui o nome em 2-3 linhas quando houver espaço.
+   pieces=[];line=''
+   for word in words:
+    trial=(line+' '+word).strip()
+    if stringWidth(trial,'Helvetica-Bold',header_font)<=person_w-5:line=trial
+    else:
+     if line:pieces.append(line)
+     line=word
+   if line:pieces.append(line)
+   if len(pieces)>3:pieces=[compact_name(name,person_w-5,header_font)]
+   c.setFont('Helvetica-Bold',header_font)
+   for k,part in enumerate(pieces[:3]):c.drawCentredString((xs[j+2]+xs[j+3])/2,body_top+25-k*9,part)
+  for i,(_,row) in enumerate(df.iterrows()):
+   top=body_top-i*row_h;bottom=top-row_h
+   if i%2==1:c.setFillColor(HexColor('#F4F5F6'));c.rect(x0,bottom,available,row_h,stroke=0,fill=1)
+   day=str(row['Dia']);
+   if 'Feriado' in day:
+    c.setFillColor(HexColor('#FFE0C4'));c.rect(x0,bottom,date_w+day_w,row_h,stroke=0,fill=1)
+   c.setFillColor(HexColor('#222222'))
+   draw_wrapped(str(row['Data']),(xs[0]+xs[1])/2,bottom+row_h/2+2,date_w-4,6.3,1)
+   draw_wrapped(day,(xs[1]+xs[2])/2,bottom+row_h/2+2,day_w-4,6.1,1)
+   for j,name in enumerate(people):
+    value='' if pd.isna(row[name]) else str(row[name]).strip()
+    if value.upper().startswith('FOLGA'):
+     c.setFillColor(HexColor('#CDEBC7'));c.rect(xs[j+2],bottom,person_w,row_h,stroke=0,fill=1)
+    c.setFillColor(HexColor('#202020'))
+    if len(value)>25 and person_w<65:
+     # Evita texto invisível, mantendo o início da informação e 2 linhas.
+     draw_wrapped(value,(xs[j+2]+xs[j+3])/2,bottom+row_h/2+4,person_w-3,max(4.0,cell_font-0.5),2)
+    else:draw_wrapped(value,(xs[j+2]+xs[j+3])/2,bottom+row_h/2+2,person_w-3,cell_font,2)
+  c.setStrokeColor(HexColor('#CFD3D6'));c.setLineWidth(.3)
+  for x in xs:c.line(x,body_top+header_h,x,body_top-len(df)*row_h)
+  for i in range(len(df)+1):
+   y=body_top-i*row_h;c.line(x0,y,x0+available,y)
+  c.line(x0,body_top+header_h,x0+available,body_top+header_h)
+  c.setFont('Helvetica',6.2);c.setFillColor(HexColor('#555555'))
+  c.drawString(m,8,'Laranja: feriado  |  Verde: folga  |  Escala personalizada')
+  c.drawRightString(W-m,8,'Emissão: '+datetime.now().strftime('%d/%m/%Y %H:%M'))
+  c.showPage()
+ c.save();return buf.getvalue()
 
 # Exportação editável com identificação do arquivo e valores originais para detectar mudanças.
 def roster_excel_bytes(df,roster):
@@ -896,8 +950,9 @@ elif page=='Escalas':
     a,b=st.columns(2)
     with a:st.download_button('Baixar Excel',roster_excel_bytes(df,roster),file_name=f'escala_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
     with b:
-     pdf_values=dict(exceptions);pdf_values.update(saved)
-     st.download_button('Baixar PDF',render_pdf_from_dataframe(roster['title'],df,year,month),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
+     pdf_mode=st.selectbox('Quantidade de folhas do PDF',['Automático (1 ou 2 folhas)','1 folha','2 folhas'],key=f'pdf_pages_{rid}',help='Formato sempre A4 paisagem. Automático prioriza a legibilidade.')
+     pdf_choice={'Automático (1 ou 2 folhas)':'auto','1 folha':'1','2 folhas':'2'}[pdf_mode]
+     st.download_button('Baixar PDF',render_pdf_from_dataframe(roster['title'],df,year,month,pdf_choice),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
 elif page=='Ações em massa':
  st.title('Ações em massa')
  team=st.selectbox('Departamento',TEAMS,key='bulk_team') if TEAMS else None
