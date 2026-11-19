@@ -218,6 +218,7 @@ def init_db():
   c.execute('''CREATE TABLE IF NOT EXISTS custom_rosters(id INTEGER PRIMARY KEY,title TEXT NOT NULL,year INTEGER NOT NULL,month INTEGER NOT NULL,departments TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);''')
   c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_members(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,PRIMARY KEY(roster_id,person_id));''')
   c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_days(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,day TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(roster_id,person_id,day));''')
+  c.execute('CREATE TABLE IF NOT EXISTS custom_roster_layout(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(roster_id,person_id))')
   c.execute('CREATE TABLE IF NOT EXISTS import_log(id INTEGER PRIMARY KEY,filename TEXT,imported_at TEXT,rows_total INTEGER,rows_active INTEGER,rows_inactive INTEGER,warning_count INTEGER)')
   c.execute('CREATE TABLE IF NOT EXISTS fixed_schedule_changes(person_id INTEGER NOT NULL,effective_day TEXT NOT NULL,hours TEXT NOT NULL,confirmed_at TEXT NOT NULL,PRIMARY KEY(person_id,effective_day))')
   for d,name in {'2026-10-12':'Nossa Senhora Aparecida','2026-11-02':'Finados','2026-11-15':'Proclamação da República','2026-11-20':'Consciência Negra','2026-12-25':'Natal','2027-01-01':'Confraternização Universal'}.items():
@@ -463,6 +464,42 @@ def render_pdf(team,people,days,exceptions,holidays,year,month):
  c.drawRightString(W-margin,10,'Emissão: '+datetime.now().strftime('%d/%m/%Y %H:%M'))
  c.showPage();c.save();return buf.getvalue()
 
+def render_pdf_from_dataframe(title,df,year,month):
+ from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,PageBreak,Spacer
+ from reportlab.lib.pagesizes import A3,landscape
+ from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+ from reportlab.lib.colors import HexColor
+ from reportlab.lib.enums import TA_CENTER
+ from xml.sax.saxutils import escape
+ buf=io.BytesIO(); page_w,page_h=landscape(A3)
+ styles=getSampleStyleSheet()
+ styles.add(ParagraphStyle(name='GDSCell',fontName='Helvetica',fontSize=6.8,leading=8.5,alignment=TA_CENTER,wordWrap='CJK'))
+ styles.add(ParagraphStyle(name='GDSHeader',fontName='Helvetica-Bold',fontSize=7.3,leading=9,alignment=TA_CENTER,wordWrap='CJK'))
+ doc=SimpleDocTemplate(buf,pagesize=(page_w,page_h),leftMargin=22,rightMargin=22,topMargin=30,bottomMargin=24)
+ story=[];allcols=list(df.columns)
+ # A largura mínima impede que horários e coberturas sejam truncados.
+ for offset in range(2,len(allcols),7):
+  cols=allcols[:2]+allcols[offset:offset+7]
+  story.append(Paragraph(escape('ESCALA DE '+title.upper()),styles['Heading2']))
+  story.append(Paragraph(escape(f'{MONTHS[month-1].upper()} / {year} — Colaboradores {offset-1} a {min(offset+5,len(allcols)-2)}'),styles['Normal']))
+  story.append(Spacer(1,10))
+  data=[[Paragraph(escape(str(c)),styles['GDSHeader']) for c in cols]]
+  for _,row in df.iterrows():
+   data.append([Paragraph(escape(str(row[c]) if pd.notna(row[c]) else '').replace(' | ','<br/>'),styles['GDSCell']) for c in cols])
+  width=page_w-44
+  widths=[75,94]+[(width-169)/(len(cols)-2)]*(len(cols)-2)
+  t=Table(data,colWidths=widths,repeatRows=1,hAlign='LEFT')
+  cmds=[('BACKGROUND',(0,0),(-1,0),HexColor('#303030')),('TEXTCOLOR',(0,0),(-1,0),HexColor('#ffffff')),('GRID',(0,0),(-1,-1),.35,HexColor('#bfc3c7')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4)]
+  for i in range(1,len(data)):
+   if i%2==0:cmds.append(('BACKGROUND',(0,i),(-1,i),HexColor('#f2f3f5')))
+   if 'Feriado' in str(df.iloc[i-1]['Dia']):cmds.append(('BACKGROUND',(0,i),(1,i),HexColor('#ffe0bc')))
+   for j,c in enumerate(cols[2:],2):
+    if str(df.iloc[i-1][c]).upper().startswith('FOLGA'):cmds.append(('BACKGROUND',(j,i),(j,i),HexColor('#c9ebc2')))
+  t.setStyle(TableStyle(cmds));story.append(t)
+  if offset+7<len(allcols):story.append(PageBreak())
+ doc.build(story)
+ return buf.getvalue()
+
 # Exportação editável com identificação do arquivo e valores originais para detectar mudanças.
 def roster_excel_bytes(df,roster):
  from openpyxl.styles import Font,PatternFill
@@ -521,7 +558,7 @@ def parse_roster_excel(file,roster,group,days,saved,exceptions):
     if str(actual or '').strip()!=originals[key].strip():raise ValueError(f'A escala foi modificada após o download ({label}, {name}). Baixe novamente antes de importar.')
     changes.append((names[name],d,new,actual))
  if seen!=set(allowed):raise ValueError('O arquivo precisa manter todas as datas do mês.')
- return changes
+ return changes,cols[2:]
 
 def proposed_fixed_changes(group,days,saved):
  # Mais de uma semana = oito datas consecutivas de vigência de um mesmo horário.
@@ -721,6 +758,10 @@ elif page=='Escalas':
   group=[p for p in active if p['id'] in member_ids]
   # Classifica pelo horário efetivo mais cedo na escala, sem depender da ordem de cadastro.
   group.sort(key=lambda p:(min((start_minutes(saved.get((p['id'],d.isoformat()),current(p,d,exceptions))) for d in days if not is_off(saved.get((p['id'],d.isoformat()),current(p,d,exceptions)))),default=9999),normalize_name(p['name'])))
+  layout=query('SELECT person_id,position FROM custom_roster_layout WHERE roster_id=? ORDER BY position',(rid,))
+  if layout:
+   byid={p['id']:p for p in group}
+   group=[byid[r['person_id']] for r in layout if r['person_id'] in byid]
   st.subheader(roster['title'])
   st.caption(f'{MONTHS[month-1]}/{year} · {len(group)} colaboradores · Clique duas vezes em uma célula para editar')
   if not group:st.info('Esta escala não tem colaboradores ativos. Abra “Título, departamentos e colaboradores” para selecionar.')
@@ -790,10 +831,10 @@ elif page=='Escalas':
     uploaded=st.file_uploader('Envie o Excel exportado desta escala após editar os horários, folgas ou coberturas',type=['xlsx'],key=f'v12_excel_{rid}')
     if uploaded is not None:
      try:
-      changes_excel=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
-      if not changes_excel:st.info('Nenhuma alteração encontrada no Excel.')
-      else:
-       st.write(f'{len(changes_excel)} célula(s) alterada(s). Colaboradores omitidos no Excel permanecem na escala salva.')
+      changes_excel,excel_columns=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
+      if not changes_excel:st.info('Nenhuma alteração de célula encontrada. A ordem e seleção das colunas podem ser importadas mesmo assim.')
+      if True:
+       st.write(f'{len(changes_excel)} célula(s) alterada(s). Colunas do Excel: {len(excel_columns)}. Colaboradores omitidos permanecem cadastrados, mas não aparecerão nesta versão da escala.')
        st.dataframe(pd.DataFrame([{'Data':fmt(d),'Colaborador':p['name'],'Anterior':old,'Novo':new} for p,d,new,old in changes_excel]),hide_index=True,use_container_width=True)
        if st.button('Confirmar importação e salvar no GitHub',type='primary',key=f'v12_import_{rid}'):
         def apply_excel():
@@ -808,6 +849,8 @@ elif page=='Escalas':
            updates[(target['id'],d.isoformat())]='FOLGA | COBERTO POR '+p['name']
           else:updates[(p['id'],d.isoformat())]=new
          with connect() as c:
+          c.execute('DELETE FROM custom_roster_layout WHERE roster_id=?',(rid,))
+          c.executemany('INSERT INTO custom_roster_layout(roster_id,person_id,position) VALUES(?,?,?)',[(rid,next(p['id'] for p in group if p['name']==name),pos) for pos,name in enumerate(excel_columns)])
           c.executemany('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?) ON CONFLICT(roster_id,person_id,day) DO UPDATE SET value=excluded.value',[(rid,pid,day,val) for (pid,day),val in updates.items()])
           c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(now,rid))
         if persist_change(apply_excel):
@@ -831,7 +874,7 @@ elif page=='Escalas':
     with a:st.download_button('Baixar Excel',roster_excel_bytes(df,roster),file_name=f'escala_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
     with b:
      pdf_values=dict(exceptions);pdf_values.update(saved)
-     st.download_button('Baixar PDF',render_pdf(roster['title'],group,days,pdf_values,holidays,year,month),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
+     st.download_button('Baixar PDF',render_pdf_from_dataframe(roster['title'],df,year,month),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
 elif page=='Ações em massa':
  st.title('Ações em massa')
  team=st.selectbox('Departamento',TEAMS,key='bulk_team') if TEAMS else None
