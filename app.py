@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v8.1 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v10 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -13,6 +13,7 @@ import json
 import requests
 import unicodedata
 import tempfile
+import csv
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -209,30 +210,15 @@ def init_db():
   CREATE TABLE IF NOT EXISTS holidays(day TEXT PRIMARY KEY,label TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
   CREATE TABLE IF NOT EXISTS monthly_baseline(person_id INTEGER,day TEXT,value TEXT,PRIMARY KEY(person_id,day));''')
-  # Only migrate legacy data once; never overwrite subsequent user changes.
-  migrated=c.execute("SELECT value FROM meta WHERE key='migration_v6'").fetchone()
-  if not migrated:
-   for (old_team,old_name),new_name in LEGACY.items():
-    c.execute('UPDATE people SET name=?,team=? WHERE name=? AND team=?',(new_name,'Motorista' if old_team=='Motoristas' else 'Operação',old_name,old_team))
-   for name,team,role,regular,offdays,pattern in INITIAL:
-    row=c.execute('SELECT id FROM people WHERE name=? AND team=?',(name,team)).fetchone()
-    if row:
-     c.execute('UPDATE people SET role=?,regular=?,offdays=?,pattern=? WHERE id=?',(role,regular,offdays,pattern,row['id']))
-    else:
-     c.execute('INSERT INTO people(name,team,role,regular,offdays,pattern) VALUES(?,?,?,?,?,?)',(name,team,role,regular,offdays,pattern))
-   c.execute("INSERT INTO meta(key,value) VALUES('migration_v6','done')")
-  if not c.execute("SELECT 1 FROM meta WHERE key='migration_v7'").fetchone():
-   # Preserve a copy before removing an incorrectly registered person.
-   bad=c.execute("SELECT id FROM people WHERE name=?",('WELLINGTON NOGUEIRA DE SOUZA',)).fetchall()
-   for row in bad:
-    pid=row['id']
-    c.execute('DELETE FROM exceptions WHERE person_id=?',(pid,))
-    c.execute('DELETE FROM audit WHERE person_id=?',(pid,))
-    c.execute('DELETE FROM people WHERE id=?',(pid,))
-   c.execute("UPDATE people SET regular='09:00–17:20' WHERE name='FABIO CIPRIANO SANTANA' AND regular IN ('14:00–22:20','14:00-22:20')")
-   c.execute("UPDATE people SET team='Operação' WHERE team IN ('Líderes / Auxiliares','Líderes/Auxiliares','Operacao')")
-   c.execute("UPDATE people SET team='Motorista' WHERE team='Motoristas'")
-   c.execute("INSERT INTO meta(key,value) VALUES('migration_v7','done')")
+   # Importação é a única fonte de cadastros. Nunca recriar colaboradores antigos.
+  columns={r[1] for r in c.execute('PRAGMA table_info(people)').fetchall()}
+  for col,typ in [('external_id','TEXT'),('source_department','TEXT'),('raw_schedule','TEXT'),('import_managed','INTEGER NOT NULL DEFAULT 0')]:
+   if col not in columns:c.execute(f'ALTER TABLE people ADD COLUMN {col} {typ}')
+  c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_people_external ON people(external_id) WHERE external_id IS NOT NULL')
+  c.execute('''CREATE TABLE IF NOT EXISTS custom_rosters(id INTEGER PRIMARY KEY,title TEXT NOT NULL,year INTEGER NOT NULL,month INTEGER NOT NULL,departments TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);''')
+  c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_members(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,PRIMARY KEY(roster_id,person_id));''')
+  c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_days(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,day TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(roster_id,person_id,day));''')
+  c.execute('CREATE TABLE IF NOT EXISTS import_log(id INTEGER PRIMARY KEY,filename TEXT,imported_at TEXT,rows_total INTEGER,rows_active INTEGER,rows_inactive INTEGER,warning_count INTEGER)')
   for d,name in {'2026-10-12':'Nossa Senhora Aparecida','2026-11-02':'Finados','2026-11-15':'Proclamação da República','2026-11-20':'Consciência Negra','2026-12-25':'Natal','2027-01-01':'Confraternização Universal'}.items():
    c.execute('INSERT OR IGNORE INTO holidays(day,label) VALUES(?,?)',(d,name))
 
@@ -259,6 +245,118 @@ def planned(p,d):
    k,v=item.split('=',1)
    rules[k.strip()]=v.strip()
  return rules.get(str(d.weekday()),p['regular'])
+
+# Importação da planilha de funcionários (colunas I, AH, BD e BP).
+# Não armazena CPF, PIS, endereço ou outros dados pessoais desnecessários.
+REQUIRED_COLS=['id_funcionario','Nome','Departamento','Cargo','Ativo','Data de Demissão','Horário de Trabalho']
+DAY_CODES={'SEG':0,'TER':1,'QUA':2,'QUI':3,'SEX':4,'SAB':5,'DOM':6}
+
+def parse_time(fragment):
+ fragment=str(fragment).strip().upper()
+ # Aceita 08H, 08HS, 08H30, 08:30, 17/01H15 e 17H48.
+ m=re.search(r'(?<!\d)(\d{1,2})(?:H(?:S)?|:)(\d{0,2})(?!\d)',fragment)
+ if not m:return None
+ hh=int(m.group(1));mm=int(m.group(2) or 0)
+ if hh>23 or mm>59:return None
+ return f'{hh:02d}:{mm:02d}'
+
+def parse_schedule(raw,name=''):
+ raw=' '.join(str(raw).upper().split())
+ # Padrões especiais, definidos e confirmados pela operação.
+ who=normalize_name(name)
+ if who=='ERONALDO SOARES DE MOURA':
+  return ('17:00–01:15','5','0=17:00–01:15;1=17:00–01:15;2=22:00–05:25;3=17:00–01:15;4=22:00–05:25;6=16:00–00:20',None)
+ if who=='WELLINGTON JORGE DA SILVA':
+  return ('22:00–05:25','5','0=22:00–05:25;1=22:00–05:25;2=17:00–01:15;3=22:00–05:25;4=17:00–01:15;6=22:00–05:25',None)
+ off=set()
+ match=re.search(r'FOL\s+([A-Z/ ]+)',raw)
+ if match:
+  for token in re.findall(r'SEG|TER|QUA|QUI|SEX|SAB|DOM',match.group(1)):
+   off.add(DAY_CODES[token])
+ # O texto da planilha pode ter um ou mais turnos, ou rodízio semanal.
+ tokens=re.findall(r'(\d{1,2}(?:H(?:S)?|:)\d{0,2})\s*AS\s*(\d{1,2}(?:H(?:S)?|:)\d{0,2})',raw)
+ if not tokens:
+  # Horários especiais escritos como 17/01H15, não assumir alternância.
+  return ('A DEFINIR',','.join(map(str,sorted(off))),'','Horário não reconhecido; revisar manualmente: '+raw)
+ intervals=[]
+ for a,b in tokens:
+  a=parse_time(a);b=parse_time(b)
+  if a and b:intervals.append(a+'–'+b)
+ if not intervals:return ('A DEFINIR',','.join(map(str,sorted(off))),'','Horário inválido: '+raw)
+ regular=intervals[0];pattern='';warning=None
+ if len(intervals)>1:
+  # Exemplos SEG ... TER A SAB ... / SAB ...: mapear dias específicos.
+  match2=re.search(r'SEG\s+\d{1,2}(?:H|:)\d{0,2}\s+AS\s+\d{1,2}(?:H|:)\d{0,2}\s+TER\s+A\s+SAB',raw)
+  if match2:pattern='0='+intervals[0]+';'+';'.join(f'{d}={intervals[1]}' for d in range(1,6))
+  elif ' SAB ' in raw and len(intervals)==2:pattern='5='+intervals[1]
+  else:warning='Escala com múltiplos turnos exige conferência: '+raw
+ if 'SEMANA' in raw:
+  warning='Alternância semanal não especificada completamente; revisar: '+raw
+ if not off and 'FOL' not in raw:warning=warning or 'Folgas não informadas: '+raw
+ return regular,','.join(map(str,sorted(off))),pattern,warning
+
+def read_staff_file(upload):
+ data=upload.getvalue()
+ if upload.name.lower().endswith('.csv'):
+  frame=pd.read_csv(io.BytesIO(data),sep=';',dtype=str,encoding='utf-8-sig',keep_default_na=False)
+ else:
+  frame=pd.read_excel(io.BytesIO(data),dtype=str,keep_default_na=False)
+ frame.columns=[str(c).strip() for c in frame.columns]
+ missing=[c for c in REQUIRED_COLS if c not in frame.columns]
+ if missing:raise ValueError('Colunas obrigatórias ausentes: '+', '.join(missing))
+ frame=frame.fillna('')
+ records=[];warnings=[];seen_ids=set();seen_names=set()
+ for _,r in frame.iterrows():
+  external=str(r['id_funcionario']).strip();name=' '.join(str(r['Nome']).upper().split())
+  if not external or not name:continue
+  if external in seen_ids or normalize_name(name) in seen_names:
+   warnings.append('Registro duplicado na planilha: '+name);continue
+  seen_ids.add(external);seen_names.add(normalize_name(name))
+  dept=str(r['Departamento']).strip().upper() or 'SEM DEPARTAMENTO'
+  role=str(r['Cargo']).strip()
+  raw=str(r['Horário de Trabalho']).strip()
+  active=str(r['Ativo']).strip()=='1' and not str(r['Data de Demissão']).strip()
+  regular,offdays,pattern,warning=parse_schedule(raw,name)
+  if active and warning:warnings.append(name+': '+warning)
+  records.append({'external_id':external,'name':name,'team':dept,'role':role,'regular':regular,'offdays':offdays,'pattern':pattern,'raw_schedule':raw,'active':int(active)})
+ if not records:raise ValueError('Nenhum colaborador válido encontrado.')
+ return records,warnings,len(frame)
+
+def import_staff(records,filename,total,warnings):
+ def operation():
+  existing=query('SELECT * FROM people')
+  byext={str(p['external_id']):p for p in existing if p.get('external_id')}
+  byname={normalize_name(p['name']):p for p in existing}
+  incoming_ids=set()
+  # Congela a escala planejada de meses anteriores antes de trocar o horário-base.
+  for r in records:
+   old=byext.get(r['external_id']) or byname.get(normalize_name(r['name']))
+   if old and (old['regular'],old['offdays'],old['pattern'])!=(r['regular'],r['offdays'],r['pattern']):
+    record_month_baseline(old)
+  with connect() as c:
+   for r in records:
+    old=byext.get(r['external_id']) or byname.get(normalize_name(r['name']))
+    if old:
+     pid=old['id'];incoming_ids.add(pid)
+     # Preserva histórico de meses anteriores se o horário mudar.
+     # Histórico de alterações manuais permanece associado ao ID.
+     c.execute('UPDATE people SET name=?,team=?,role=?,regular=?,offdays=?,pattern=?,active=?,external_id=?,source_department=?,raw_schedule=?,import_managed=1 WHERE id=?',
+      (r['name'],r['team'],r['role'],r['regular'],r['offdays'],r['pattern'],r['active'],r['external_id'],r['team'],r['raw_schedule'],pid))
+    else:
+     c.execute('INSERT INTO people(name,team,role,regular,offdays,pattern,active,external_id,source_department,raw_schedule,import_managed) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+      (r['name'],r['team'],r['role'],r['regular'],r['offdays'],r['pattern'],r['active'],r['external_id'],r['team'],r['raw_schedule']))
+     incoming_ids.add(c.lastrowid)
+   # A ÚLTIMA planilha é a fonte oficial. Ausentes/inativos não aparecem na escala.
+   if incoming_ids:
+    placeholders=','.join('?' for _ in incoming_ids)
+    c.execute(f'UPDATE people SET active=0 WHERE id NOT IN ({placeholders})',tuple(incoming_ids))
+   else:
+    c.execute('UPDATE people SET active=0')
+   # Retira somente inativos das escalas personalizadas, sem apagar edições dos demais.
+   c.execute('DELETE FROM custom_roster_members WHERE person_id IN (SELECT id FROM people WHERE active=0)')
+   c.execute('INSERT INTO import_log(filename,imported_at,rows_total,rows_active,rows_inactive,warning_count) VALUES(?,?,?,?,?,?)',
+    (filename,datetime.now().isoformat(timespec='seconds'),total,sum(r['active'] for r in records),sum(not r['active'] for r in records),len(warnings)))
+ return persist_change(operation)
 
 def current(p,d,exceptions):
  if (p['id'],d.isoformat()) in exceptions:return exceptions[(p['id'],d.isoformat())]
@@ -397,13 +495,14 @@ login()
 with st.sidebar:
  st.markdown(f'<div style="text-align:center;padding:14px 8px;margin-bottom:12px;background:#242424;border-radius:12px"><img src="data:image/png;base64,{LOGO_B64}" style="width:160px;max-width:90%"/></div>',unsafe_allow_html=True)
  st.markdown('**GESTÃO DE ESCALAS**')
- page=st.radio('Navegação',['Visão geral','Escalas','Folgas','Colaboradores','Feriados','Ações em massa','Histórico'],label_visibility='collapsed')
+ page=st.radio('Navegação',['Visão geral','Importar planilha','Escalas','Escalas personalizadas','Folgas','Colaboradores','Feriados','Ações em massa','Histórico'],label_visibility='collapsed')
  st.divider()
  if st.button('Sair',use_container_width=True):st.session_state.authorized=False;st.rerun()
 
 if st.session_state.get('flash'):st.success(st.session_state.pop('flash'),icon='✅')
 people=query('SELECT * FROM people ORDER BY team,name')
 active=[p for p in people if p['active']]
+TEAMS=sorted(set(p['team'] for p in active))
 exceptions={(r['person_id'],r['day']):r['value'] for r in query('SELECT * FROM exceptions')}
 holidays={r['day']:r['label'] for r in query('SELECT * FROM holidays')}
 
@@ -437,18 +536,47 @@ def validate_value(value):
 if page=='Visão geral':
  st.title('Visão geral')
  cols=st.columns(4)
- for col,label,num in zip(cols,['Colaboradores ativos','Motoristas','Operação','Equipes'],[len(active),sum(p['team']=='Motorista' for p in active),sum(p['team']=='Operação' for p in active),2]):col.metric(label,num)
+ for col,label,num in zip(cols,['Colaboradores ativos','Departamentos','Horários importados','Importações'],[len(active),len(TEAMS),sum(bool(p.get('raw_schedule')) for p in active),len(query('SELECT * FROM import_log'))]):col.metric(label,num)
  today=date.today();st.subheader('Equipe de hoje')
  for team in TEAMS:
   group=sort_team([p for p in active if p['team']==team])
   working=sum(not is_off(current(p,today,exceptions)) for p in group)
   st.write(f'**{team}** — {working} escalados de {len(group)} colaboradores')
 
+elif page=='Importar planilha':
+ st.title('Atualizar colaboradores pela planilha')
+ st.write('A última planilha importada substitui a lista de colaboradores ativos. As escalas e alterações históricas são preservadas.')
+ upload=st.file_uploader('Selecione a planilha de funcionários',type=['csv','xlsx','xls'],key='staff_upload')
+ if upload is not None:
+  try:
+   records,warnings,total=read_staff_file(upload)
+   eligible=[r for r in records if r['active']]
+   a,b,c=st.columns(3)
+   a.metric('Linhas da planilha',total)
+   b.metric('Colaboradores ativos',len(eligible))
+   c.metric('Departamentos',len(set(r['team'] for r in eligible)))
+   st.dataframe(pd.DataFrame([{'Nome':r['name'],'Departamento':r['team'],'Cargo':r['role'],'Horário de Trabalho (BD)':r['raw_schedule'],'Horário identificado':r['regular']} for r in eligible]),hide_index=True,use_container_width=True)
+   if warnings:
+    st.warning(f'{len(warnings)} observações sobre horários ou registros. Confira antes de confirmar.')
+    with st.expander('Ver observações'):
+     for w in warnings:st.write('• '+w)
+   st.info('Funcionários ausentes da última planilha, com Ativo diferente de 1 ou com data de demissão serão inativados. O histórico anterior será mantido.')
+   confirm=st.checkbox('Confirmo que esta é a planilha mais recente e quero atualizar os cadastros ativos.')
+   if st.button('Salvar planilha e atualizar escalas',type='primary',disabled=not confirm,use_container_width=True):
+    if import_staff(records,upload.name,total,warnings):
+     flash(f'Planilha salva com sucesso! {len(eligible)} colaboradores ativos e {len(set(r["team"] for r in eligible))} departamentos atualizados.')
+  except Exception as exc:st.error('Não foi possível ler a planilha: '+str(exc))
+ logs=query('SELECT filename,imported_at,rows_total,rows_active,warning_count FROM import_log ORDER BY id DESC LIMIT 5')
+ if logs:
+  st.subheader('Últimas importações')
+  st.dataframe(pd.DataFrame(logs).rename(columns={'filename':'Arquivo','imported_at':'Importado em','rows_total':'Linhas','rows_active':'Ativos','warning_count':'Observações'}),hide_index=True,use_container_width=True)
+
 elif page=='Escalas':
  st.title('Escalas')
- team=st.segmented_control('Equipe',TEAMS,default='Motorista',key='scale_team')
+ departments=st.multiselect('Departamentos (selecione um ou mais)',TEAMS,default=TEAMS[:1],key='scale_departments')
+ team=' + '.join(departments) or 'Sem departamento'
  year,month=month_filters('scale')
- group=sort_team([p for p in active if p['team']==team])
+ group=sort_team([p for p in active if p['team'] in departments])
  days=month_days(year,month)
  if group:
   data=[]
@@ -498,9 +626,97 @@ elif page=='Escalas':
    if persist_change(restore):flash('Padrão restaurado e tabela atualizada.')
  else:st.info('Não há colaboradores ativos nessa equipe.')
 
+elif page=='Escalas personalizadas':
+ st.title('Escalas personalizadas')
+ st.caption('Monte escalas com vários departamentos, dê um título e mantenha as alterações salvas. Na próxima importação, somente os inativos serão retirados da composição.')
+ rosters=query('SELECT * FROM custom_rosters ORDER BY updated_at DESC,id DESC')
+ options=['➕ Criar nova escala']+[f"{r['title']} · {MONTHS[r['month']-1]}/{r['year']} · #{r['id']}" for r in rosters]
+ choice=st.selectbox('Selecionar escala salva ou criar nova',options,key='roster_choice')
+ selected=None if choice==options[0] else rosters[options.index(choice)-1]
+ if selected is None:
+  title=st.text_input('Título da escala',placeholder='Ex.: Operação VCP + Motoristas — Novembro',key='new_roster_title')
+  departments=st.multiselect('Departamentos',TEAMS,key='new_roster_depts')
+  year,month=month_filters('new_roster')
+  members=sort_team([p for p in active if p['team'] in departments])
+  st.caption(f'{len(members)} colaboradores ativos encontrados nos departamentos selecionados.')
+  if members:
+   chosen=st.multiselect('Colaboradores que farão parte da escala',members,default=members,format_func=lambda p:p['name']+' · '+p['team'],key='new_roster_members')
+  else:chosen=[]
+  if st.button('💾 Criar e salvar escala personalizada',type='primary',use_container_width=True):
+   if not title.strip():st.error('Informe um título para identificar a escala.')
+   elif not departments or not chosen:st.error('Selecione pelo menos um departamento e um colaborador.')
+   else:
+    def create_roster():
+     now=datetime.now().isoformat(timespec='seconds')
+     with connect() as c:
+      cur=c.execute('INSERT INTO custom_rosters(title,year,month,departments,created_at,updated_at) VALUES(?,?,?,?,?,?)',(title.strip(),year,month,json.dumps(departments,ensure_ascii=False),now,now))
+      rid=cur.lastrowid
+      c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,p['id']) for p in chosen])
+      # Congela a composição e os horários atuais do mês. Edições futuras não sobrescrevem o salvo.
+      c.executemany('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?)',[(rid,p['id'],d.isoformat(),current(p,d,exceptions)) for p in chosen for d in month_days(year,month)])
+    if persist_change(create_roster):
+     st.session_state.pop('roster_choice',None)
+     flash('Escala personalizada criada e salva com sucesso!')
+ else:
+  rid=selected['id'];year=selected['year'];month=selected['month'];days=month_days(year,month)
+  member_ids={r['person_id'] for r in query('SELECT person_id FROM custom_roster_members WHERE roster_id=?',(rid,))}
+  group=sort_team([p for p in active if p['id'] in member_ids])
+  saved={(r['person_id'],r['day']):r['value'] for r in query('SELECT person_id,day,value FROM custom_roster_days WHERE roster_id=?',(rid,))}
+  st.subheader(selected['title'])
+  st.caption(f'{MONTHS[month-1]}/{year} · {len(group)} colaboradores ativos · edição independente da escala geral')
+  with st.expander('✏️ Alterar título e colaboradores desta escala'):
+   newtitle=st.text_input('Título',value=selected['title'],key=f'roster_title_{rid}')
+   deptchoices=st.multiselect('Departamentos',TEAMS,default=[t for t in json.loads(selected['departments']) if t in TEAMS],key=f'roster_depts_{rid}')
+   pool=sort_team([p for p in active if p['team'] in deptchoices])
+   selected_people=st.multiselect('Colaboradores',pool,default=[p for p in pool if p['id'] in member_ids],format_func=lambda p:p['name']+' · '+p['team'],key=f'roster_members_{rid}')
+   if st.button('Salvar título e composição',type='primary',key=f'roster_save_members_{rid}'):
+    if not newtitle.strip() or not selected_people:st.error('Informe um título e selecione colaboradores.')
+    else:
+     def change_roster():
+      with connect() as c:
+       c.execute('UPDATE custom_rosters SET title=?,departments=?,updated_at=? WHERE id=?',(newtitle.strip(),json.dumps(deptchoices,ensure_ascii=False),datetime.now().isoformat(timespec='seconds'),rid))
+       c.execute('DELETE FROM custom_roster_members WHERE roster_id=?',(rid,))
+       c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,p['id']) for p in selected_people])
+       c.executemany('INSERT OR IGNORE INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?)',[(rid,p['id'],d.isoformat(),current(p,d,exceptions)) for p in selected_people for d in days])
+     if persist_change(change_roster):flash('Título e colaboradores salvos com sucesso!')
+  if group:
+   data=[]
+   for d in days:
+    rec={'Data':fmt(d),'Dia':WEEK[d.weekday()]}
+    for p in group:rec[p['name']]=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
+    data.append(rec)
+   df=pd.DataFrame(data)
+   st.dataframe(df,use_container_width=True,hide_index=True,height=560)
+   st.download_button('⬇️ Exportar Excel da escala personalizada',excel_bytes(df),file_name=f'escala_personalizada_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+   custom_exceptions=dict(exceptions);custom_exceptions.update(saved)
+   st.download_button('🖨️ Exportar PDF da escala personalizada',render_pdf(selected['title'],group,days,custom_exceptions,holidays,year,month),file_name=f'escala_personalizada_{rid}_{year}_{month:02d}.pdf',mime='application/pdf')
+   st.subheader('Editar data e horário da escala personalizada')
+   a,b=st.columns(2)
+   with a:person=person_select('Colaborador',group,f'roster_person_{rid}')
+   with b:day=date_field('Data',days[0],f'roster_day_{rid}')
+   if day.year!=year or day.month!=month:st.warning('Selecione uma data dentro do mês da escala.')
+   else:
+    effective=saved.get((person['id'],day.isoformat()),current(person,day,exceptions))
+    st.caption('Horário salvo: '+effective)
+    # Campo sempre editável, inclusive em horários alternados e folgas.
+    identity=f'{rid}:{person["id"]}:{day.isoformat()}'
+    if st.session_state.get('roster_edit_identity')!=identity:
+     st.session_state['roster_edit_value']=effective
+     st.session_state['roster_edit_identity']=identity
+    value=st.text_input('Horário ou situação (ex.: 14:00–22:20 ou FOLGA)',key='roster_edit_value')
+    if st.button('Salvar alteração desta data',type='primary',key=f'roster_save_day_{rid}'):
+     if not value.strip():st.error('Preencha o horário ou a situação.')
+     else:
+      def change_day():
+       with connect() as c:
+        c.execute('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?) ON CONFLICT(roster_id,person_id,day) DO UPDATE SET value=excluded.value',(rid,person['id'],day.isoformat(),value.strip()))
+        c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(datetime.now().isoformat(timespec='seconds'),rid))
+      if persist_change(change_day):flash('Alteração da escala personalizada salva com sucesso!')
+  else:st.info('Nenhum colaborador ativo nesta escala. Edite a composição ou importe uma nova planilha.')
+
 elif page=='Ações em massa':
  st.title('Ações em massa')
- team=st.segmented_control('Equipe',TEAMS,default='Motorista',key='bulk_team')
+ team=st.selectbox('Departamento',TEAMS,key='bulk_team') if TEAMS else None
  group=sort_team([p for p in active if p['team']==team])
  d=date_field('Data',date(2026,10,12) if date.today().year==2026 and date.today().month==10 else date.today(),'bulk_date')
  other=st.text_input('Outras datas (DD/MM/AAAA, separadas por vírgula)',placeholder='15/11/2026, 20/11/2026')
@@ -559,52 +775,13 @@ elif page=='Folgas':
 
 elif page=='Colaboradores':
  st.title('Colaboradores')
- st.dataframe(pd.DataFrame([{'Nome':p['name'],'Equipe':p['team'],'Cargo':p['role'],'Horário':p['regular'],'Folgas':', '.join(WEEK[i] for i in off_days(p)),'Ativo':'Sim' if p['active'] else 'Não'} for p in people]),hide_index=True,use_container_width=True)
- st.subheader('Editar cadastro')
- p=person_select('Colaborador',people,'edit_person')
- with st.form('edit_person_form'):
-  name=st.text_input('Nome completo',value=p['name'])
-  team=st.selectbox('Equipe',TEAMS,index=TEAMS.index(p['team']))
-  role=st.text_input('Cargo',value=p['role'])
-  regular=st.text_input('Horário padrão',value=p['regular'])
-  off=st.multiselect('Folgas semanais',range(7),default=off_days(p),format_func=lambda i:WEEK[i])
-  pattern=st.text_area('Horários por dia da semana (0=segunda ... 6=domingo)',value=p['pattern'])
-  active_flag=st.checkbox('Ativo',value=bool(p['active']))
-  if st.form_submit_button('Salvar cadastro',type='primary'):
-   try:
-    ensure_unique_name(name,p['id'])
-    def edit_person():
-     if (regular,pattern,','.join(map(str,off)))!=(p['regular'],p['pattern'],p['offdays']):record_month_baseline(p)
-     with connect() as c:c.execute('UPDATE people SET name=?,team=?,role=?,regular=?,offdays=?,pattern=?,active=? WHERE id=?',(name.strip().upper(),team,role,regular,','.join(map(str,off)),pattern,int(active_flag),p['id']))
-    if persist_change(edit_person):flash('Cadastro atualizado com sucesso!')
-   except ValueError as exc:st.error(str(exc))
- with st.expander('Excluir ou inativar colaborador'):
-  st.warning('A exclusão definitiva apaga o cadastro e os registros associados. Para manter o histórico, desmarque Ativo e salve o cadastro.')
-  confirm=st.checkbox(f'Confirmo a exclusão definitiva de {p["name"]}',key='delete_confirm_'+str(p['id']))
-  if st.button('Excluir colaborador definitivamente',disabled=not confirm,type='secondary'):
-   def delete_person():
-    with connect() as c:
-     c.execute('DELETE FROM exceptions WHERE person_id=?',(p['id'],))
-     c.execute('DELETE FROM audit WHERE person_id=?',(p['id'],))
-     c.execute('DELETE FROM people WHERE id=?',(p['id'],))
-    st.session_state.pop('edit_person',None)
-   if persist_change(delete_person):flash('Colaborador e registros vinculados excluídos.')
- with st.expander('➕ Novo colaborador'):
-  with st.form('new_person'):
-   name=st.text_input('Nome completo',key='new_name')
-   team=st.selectbox('Equipe',TEAMS,key='new_team')
-   role=st.text_input('Cargo',key='new_role')
-   regular=st.text_input('Horário',value='09:00–17:20',key='new_hours')
-   off=st.multiselect('Folgas semanais',range(7),default=[6],format_func=lambda i:WEEK[i],key='new_off')
-   pattern=st.text_area('Horários alternados (opcional)',key='new_pattern')
-   if st.form_submit_button('Cadastrar',type='primary'):
-    try:
-     ensure_unique_name(name)
-     def create_person():
-      ensure_unique_name(name)
-      with connect() as c:c.execute('INSERT INTO people(name,team,role,regular,offdays,pattern) VALUES(?,?,?,?,?,?)',(name.strip().upper(),team,role,regular,','.join(map(str,off)),pattern))
-     if persist_change(create_person):flash('Colaborador cadastrado com sucesso!')
-    except ValueError as exc:st.error(str(exc))
+ st.caption('Cadastros atualizados exclusivamente pela última planilha importada.')
+ dept=st.selectbox('Departamento',['Todos']+TEAMS,key='people_dept')
+ listed=[p for p in active if dept=='Todos' or p['team']==dept]
+ st.metric('Colaboradores ativos',len(listed))
+ if listed:
+  st.dataframe(pd.DataFrame([{'Nome':p['name'],'Departamento':p['team'],'Cargo':p['role'],'Horário de Trabalho':p.get('raw_schedule') or p['regular'],'Horário base':p['regular'],'Folga semanal':', '.join(WEEK[i] for i in off_days(p))} for p in sort_team(listed)]),hide_index=True,use_container_width=True)
+ else:st.info('Nenhum colaborador ativo. Importe a planilha atualizada pelo menu lateral.')
 
 elif page=='Feriados':
  st.title('Feriados e datas especiais')
