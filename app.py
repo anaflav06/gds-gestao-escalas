@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v11 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v12 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -219,6 +219,7 @@ def init_db():
   c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_members(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,PRIMARY KEY(roster_id,person_id));''')
   c.execute('''CREATE TABLE IF NOT EXISTS custom_roster_days(roster_id INTEGER NOT NULL,person_id INTEGER NOT NULL,day TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(roster_id,person_id,day));''')
   c.execute('CREATE TABLE IF NOT EXISTS import_log(id INTEGER PRIMARY KEY,filename TEXT,imported_at TEXT,rows_total INTEGER,rows_active INTEGER,rows_inactive INTEGER,warning_count INTEGER)')
+  c.execute('CREATE TABLE IF NOT EXISTS fixed_schedule_changes(person_id INTEGER NOT NULL,effective_day TEXT NOT NULL,hours TEXT NOT NULL,confirmed_at TEXT NOT NULL,PRIMARY KEY(person_id,effective_day))')
   for d,name in {'2026-10-12':'Nossa Senhora Aparecida','2026-11-02':'Finados','2026-11-15':'Proclamação da República','2026-11-20':'Consciência Negra','2026-12-25':'Natal','2027-01-01':'Confraternização Universal'}.items():
    c.execute('INSERT OR IGNORE INTO holidays(day,label) VALUES(?,?)',(d,name))
 
@@ -239,6 +240,8 @@ def off_days(p): return [int(x) for x in p['offdays'].split(',') if x.strip().is
 
 def planned(p,d):
  if d.weekday() in off_days(p): return 'FOLGA'
+ changes=query('SELECT hours FROM fixed_schedule_changes WHERE person_id=? AND effective_day<=? ORDER BY effective_day DESC LIMIT 1',(p['id'],d.isoformat()))
+ if changes:return changes[0]['hours']
  rules={}
  for item in p['pattern'].split(';'):
   if '=' in item:
@@ -459,6 +462,84 @@ def render_pdf(team,people,days,exceptions,holidays,year,month):
  c.drawString(margin,10,'Laranja: feriado  |  Verde: folga  |  Nomes completos disponíveis no aplicativo')
  c.drawRightString(W-margin,10,'Emissão: '+datetime.now().strftime('%d/%m/%Y %H:%M'))
  c.showPage();c.save();return buf.getvalue()
+
+# Exportação editável com identificação do arquivo e valores originais para detectar mudanças.
+def roster_excel_bytes(df,roster):
+ from openpyxl.styles import Font,PatternFill
+ buf=io.BytesIO()
+ with pd.ExcelWriter(buf,engine='openpyxl') as writer:
+  df.to_excel(writer,index=False,sheet_name='Escala')
+  ws=writer.sheets['Escala'];ws.freeze_panes='C2'
+  for col in ws.columns:
+   ws.column_dimensions[col[0].column_letter].width=min(43,max(16,max(len(str(c.value or '')) for c in col)+2))
+  for cell in ws[1]:
+   cell.fill=PatternFill('solid',fgColor='262626');cell.font=Font(color='FFFFFF',bold=True)
+  meta=writer.book.create_sheet('_GDS_CONTROLE')
+  meta.append(['GDS_ESCALA_V12',str(roster['id']),str(roster['year']),str(roster['month'])])
+  meta.append(['Data','Colaborador','Original'])
+  for _,row in df.iterrows():
+   for name in df.columns[2:]:meta.append([str(row['Data']),str(name),str(row[name])])
+  meta.sheet_state='veryHidden'
+ return buf.getvalue()
+
+def parse_roster_excel(file,roster,group,days,saved,exceptions):
+ from openpyxl import load_workbook
+ book=load_workbook(io.BytesIO(file.getvalue()),read_only=False,data_only=True)
+ if 'Escala' not in book.sheetnames or '_GDS_CONTROLE' not in book.sheetnames:
+  raise ValueError('Envie o Excel baixado deste aplicativo, sem remover as abas de controle.')
+ meta=book['_GDS_CONTROLE']
+ header=[meta.cell(1,i).value for i in range(1,5)]
+ if header!=['GDS_ESCALA_V12',str(roster['id']),str(roster['year']),str(roster['month'])]:
+  raise ValueError('Este Excel pertence a outra escala ou período. Baixe novamente a escala correta.')
+ originals={}
+ for row in list(meta.values)[2:]:
+  if row[0] and row[1] is not None:originals[(str(row[0]),str(row[1]))]=str(row[2] or '')
+ ws=book['Escala'];rows=ws.values
+ cols=[str(v or '').strip() for v in next(rows)]
+ if cols[:2]!=['Data','Dia'] or len(set(cols))!=len(cols):raise ValueError('Não altere os cabeçalhos Data, Dia ou os nomes dos colaboradores.')
+ names={p['name']:p for p in group}
+ if set(cols[2:])!=set(names):raise ValueError('As colunas de colaboradores não correspondem à escala atual. Baixe um Excel atualizado.')
+ allowed={fmt(d):d for d in days};changes=[];seen=set()
+ for row in rows:
+  if not any(v is not None for v in row):continue
+  label=row[0]
+  if isinstance(label,(datetime,date)):label=fmt(label.date() if isinstance(label,datetime) else label)
+  label=str(label or '').strip()
+  if label not in allowed or label in seen:raise ValueError('Datas inválidas ou duplicadas no Excel: '+label)
+  seen.add(label);d=allowed[label]
+  for idx,name in enumerate(cols[2:],2):
+   key=(label,name)
+   if key not in originals:raise ValueError('Planilha de controle incompleta. Baixe um novo Excel.')
+   new=str(row[idx] if idx<len(row) and row[idx] is not None else '').strip()
+   if new!=originals[key]:
+    if not new or not validate_value(new) and not re.fullmatch(r'COBRE:\s*.+',new,re.I):
+     raise ValueError(f'Valor inválido em {label}, {name}: {new}')
+    actual=saved.get((names[name]['id'],d.isoformat()),current(names[name],d,exceptions))
+    if actual!=originals[key]:raise ValueError(f'A escala foi modificada após o download ({label}, {name}). Baixe novamente antes de importar.')
+    changes.append((names[name],d,new,actual))
+ if seen!=set(allowed):raise ValueError('O arquivo precisa manter todas as datas do mês.')
+ return changes
+
+def proposed_fixed_changes(group,days,saved):
+ # Mais de uma semana = oito datas consecutivas de vigência de um mesmo horário.
+ # Folgas semanais não interrompem a sequência; alterações explícitas de folga não viram horário fixo.
+ proposals=[]
+ for p in group:
+  old=planned(p,days[0])
+  i=0
+  while i<len(days):
+   d=days[i];value=saved.get((p['id'],d.isoformat()),'')
+   if not re.fullmatch(r'\d{2}:\d{2}[–-]\d{2}:\d{2}',value) or value==planned(p,d):i+=1;continue
+   start=i;hours=value;count=0
+   while i<len(days):
+    d2=days[i];v=saved.get((p['id'],d2.isoformat()),'')
+    if v==hours or (d2.weekday() in off_days(p) and is_off(v)):
+     count+=1;i+=1
+    else:break
+   if count>=8:
+    existing=query('SELECT 1 FROM fixed_schedule_changes WHERE person_id=? AND effective_day=? AND hours=?',(p['id'],days[start].isoformat(),hours))
+    if not existing:proposals.append((p,days[start],hours,count))
+ return proposals
 
 def excel_bytes(df):
  buf=io.BytesIO()
@@ -700,9 +781,50 @@ elif page=='Escalas':
     if persist_change(apply_grid_changes):
      st.session_state[f'v11_revision_{rid}']=revision+1
      flash('Alteração salva automaticamente no GitHub!')
+   # A importação aplica somente diferenças entre o arquivo exportado e a versão salva.
+   with st.expander('Importar Excel editado'):
+    uploaded=st.file_uploader('Envie o Excel exportado desta escala após editar os horários, folgas ou coberturas',type=['xlsx'],key=f'v12_excel_{rid}')
+    if uploaded is not None:
+     try:
+      changes_excel=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
+      if not changes_excel:st.info('Nenhuma alteração encontrada no Excel.')
+      else:
+       st.write(f'{len(changes_excel)} célula(s) alterada(s)')
+       st.dataframe(pd.DataFrame([{'Data':fmt(d),'Colaborador':p['name'],'Anterior':old,'Novo':new} for p,d,new,old in changes_excel]),hide_index=True,use_container_width=True)
+       if st.button('Confirmar importação e salvar no GitHub',type='primary',key=f'v12_import_{rid}'):
+        def apply_excel():
+         now=datetime.now().isoformat(timespec='seconds');updates={}
+         for p,d,new,old in changes_excel:
+          if new.upper().startswith('COBRE:'):
+           name=normalize_name(new.split(':',1)[1]);target=next((q for q in group if q['id']!=p['id'] and normalize_name(q['name'])==name),None)
+           if target is None:raise ValueError('Colaborador de cobertura não encontrado na escala: '+new)
+           original=saved.get((target['id'],d.isoformat()),current(target,d,exceptions)).split(' | ')[0]
+           if is_off(original) or not validate_value(original):raise ValueError('Colaborador coberto não tem horário de trabalho na data.')
+           updates[(p['id'],d.isoformat())]=original+' | COBRE FOLGA DE '+target['name']
+           updates[(target['id'],d.isoformat())]='FOLGA | COBERTO POR '+p['name']
+          else:updates[(p['id'],d.isoformat())]=new
+         with connect() as c:
+          c.executemany('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?) ON CONFLICT(roster_id,person_id,day) DO UPDATE SET value=excluded.value',[(rid,pid,day,val) for (pid,day),val in updates.items()])
+          c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(now,rid))
+        if persist_change(apply_excel):
+         st.session_state[f'v11_revision_{rid}']=revision+1
+         flash('Excel importado e alterações salvas no GitHub!')
+     except Exception as exc:st.error('Não foi possível importar: '+str(exc))
+   # O horário fixo é confirmado antes de afetar os próximos meses.
+   proposals=proposed_fixed_changes(group,days,saved)
+   if proposals:
+    with st.expander('Atualizar horário fixo para os próximos meses',expanded=True):
+     st.caption('Alterações mantidas por 8 dias ou mais podem se tornar o novo horário padrão. Nada será alterado sem sua confirmação.')
+     for p,start,hours,count in proposals:
+      st.write(f"**{p['name']}** — {hours} desde {fmt(start)} ({count} dias)")
+      if st.button('Confirmar novo horário fixo',key=f'v12_fixed_{rid}_{p["id"]}_{start.isoformat()}'):
+       def apply_fixed():
+        with connect() as c:
+         c.execute('INSERT OR REPLACE INTO fixed_schedule_changes(person_id,effective_day,hours,confirmed_at) VALUES(?,?,?,?)',(p['id'],start.isoformat(),hours,datetime.now().isoformat(timespec='seconds')))
+       if persist_change(apply_fixed):flash('Novo horário fixo salvo para os próximos meses!')
    with st.expander('Exportar escala'):
     a,b=st.columns(2)
-    with a:st.download_button('Baixar Excel',excel_bytes(df),file_name=f'escala_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+    with a:st.download_button('Baixar Excel',roster_excel_bytes(df,roster),file_name=f'escala_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
     with b:
      pdf_values=dict(exceptions);pdf_values.update(saved)
      st.download_button('Baixar PDF',render_pdf(roster['title'],group,days,pdf_values,holidays,year,month),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
