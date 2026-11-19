@@ -483,15 +483,30 @@ def render_pdf_from_dataframe(title, df, year, month, page_choice='auto'):
  per_page=math.ceil(n/page_count)
  groups=[names[i:i+per_page] for i in range(0,n,per_page)]
  c=canvas.Canvas(buf,pagesize=(W,H))
- def compact_name(name, width, font):
+ def full_name_lines(name, width, max_height):
+  """Never abbreviate employee names; fit all words inside the header."""
   words=str(name).split()
-  # Preservar identificação por nome e sobrenome, sem cortes horizontais.
-  candidates=[' '.join(words), ' '.join(words[:2]+words[-1:]) if len(words)>3 else ' '.join(words), ' '.join(words[:2]) if len(words)>1 else str(name)]
-  for candidate in candidates:
-   if stringWidth(candidate,'Helvetica-Bold',font)<=width:return candidate
-  candidate=candidates[-1]
-  while candidate and stringWidth(candidate+'…','Helvetica-Bold',font)>width:candidate=candidate[:-1]
-  return candidate+'…'
+  for font in (7.0,6.5,6.0,5.5,5.0,4.6,4.2,3.8,3.4):
+   lines=[];line=''
+   for word in words:
+    candidate=(line+' '+word).strip()
+    if stringWidth(candidate,'Helvetica-Bold',font)<=width:
+     line=candidate
+    else:
+     if line:lines.append(line)
+     line=word
+   if line:lines.append(line)
+   if lines and max(stringWidth(line,'Helvetica-Bold',font) for line in lines)<=width and len(lines)*(font+1.25)<=max_height:
+    return lines,font
+  # Extremely narrow columns: break long words, but never omit any letters.
+  font=3.2;lines=[];line=''
+  for word in words:
+   if line:lines.append(line);line=''
+   while word:
+    count=len(word)
+    while count>1 and stringWidth(word[:count],'Helvetica-Bold',font)>width:count-=1
+    lines.append(word[:count]);word=word[count:]
+  return lines,font
  def draw_wrapped(text,x,y,width,font,maxlines=2,bold=False):
   fontname='Helvetica-Bold' if bold else 'Helvetica'
   text=str(text or '').replace(' | ',' / ').replace('–','-')
@@ -515,8 +530,8 @@ def render_pdf_from_dataframe(title, df, year, month, page_choice='auto'):
   m=12; x0=m; ytop=H-47; ybottom=19
   available=W-2*m; date_w=58;day_w=70
   person_w=(available-date_w-day_w)/len(people)
-  row_h=(ytop-ybottom-34)/(len(df)+1)
-  header_h=34; body_top=ytop-header_h
+  header_h=56; body_top=ytop-header_h
+  row_h=(body_top-ybottom)/len(df)
   cell_font=min(7.3,max(4.0,person_w/9.2))
   header_font=min(8.0,max(5.1,person_w/8.8))
   c.setFillColor(HexColor('#F58232'));c.rect(0,H-41,W,41,fill=1,stroke=0)
@@ -529,19 +544,12 @@ def render_pdf_from_dataframe(title, df, year, month, page_choice='auto'):
   draw_wrapped('DATA',(xs[0]+xs[1])/2,body_top+19,date_w-4,7,1,True)
   draw_wrapped('DIA',(xs[1]+xs[2])/2,body_top+19,day_w-4,7,1,True)
   for j,name in enumerate(people):
-   words=str(name).split();full=' '.join(words)
-   # Distribui o nome em 2-3 linhas quando houver espaço.
-   pieces=[];line=''
-   for word in words:
-    trial=(line+' '+word).strip()
-    if stringWidth(trial,'Helvetica-Bold',header_font)<=person_w-5:line=trial
-    else:
-     if line:pieces.append(line)
-     line=word
-   if line:pieces.append(line)
-   if len(pieces)>3:pieces=[compact_name(name,person_w-5,header_font)]
-   c.setFont('Helvetica-Bold',header_font)
-   for k,part in enumerate(pieces[:3]):c.drawCentredString((xs[j+2]+xs[j+3])/2,body_top+25-k*9,part)
+   lines,font=full_name_lines(name,person_w-5,header_h-5)
+   c.setFont('Helvetica-Bold',font)
+   step=font+1.25
+   first_y=body_top+header_h/2+(len(lines)-1)*step/2-font*.3
+   for k,part in enumerate(lines):
+    c.drawCentredString((xs[j+2]+xs[j+3])/2,first_y-k*step,part)
   for i,(_,row) in enumerate(df.iterrows()):
    top=body_top-i*row_h;bottom=top-row_h
    if i%2==1:c.setFillColor(HexColor('#F4F5F6'));c.rect(x0,bottom,available,row_h,stroke=0,fill=1)
