@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v12 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v12.1 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -498,7 +498,10 @@ def parse_roster_excel(file,roster,group,days,saved,exceptions):
  cols=[str(v or '').strip() for v in next(rows)]
  if cols[:2]!=['Data','Dia'] or len(set(cols))!=len(cols):raise ValueError('Não altere os cabeçalhos Data, Dia ou os nomes dos colaboradores.')
  names={p['name']:p for p in group}
- if set(cols[2:])!=set(names):raise ValueError('As colunas de colaboradores não correspondem à escala atual. Baixe um Excel atualizado.')
+ # A ordem e a quantidade de colunas podem mudar no Excel.
+ # Colunas ausentes NÃO removem o colaborador da escala salva.
+ unknown=[name for name in cols[2:] if name not in names]
+ if unknown:raise ValueError('Colaborador(es) não encontrado(s) nesta escala: '+', '.join(unknown))
  allowed={fmt(d):d for d in days};changes=[];seen=set()
  for row in rows:
   if not any(v is not None for v in row):continue
@@ -512,10 +515,10 @@ def parse_roster_excel(file,roster,group,days,saved,exceptions):
    if key not in originals:raise ValueError('Planilha de controle incompleta. Baixe um novo Excel.')
    new=str(row[idx] if idx<len(row) and row[idx] is not None else '').strip()
    if new!=originals[key]:
-    if not new or not validate_value(new) and not re.fullmatch(r'COBRE:\s*.+',new,re.I):
+    if new and not validate_value(new) and not re.fullmatch(r'COBRE:\s*.+',new,re.I):
      raise ValueError(f'Valor inválido em {label}, {name}: {new}')
     actual=saved.get((names[name]['id'],d.isoformat()),current(names[name],d,exceptions))
-    if actual!=originals[key]:raise ValueError(f'A escala foi modificada após o download ({label}, {name}). Baixe novamente antes de importar.')
+    if str(actual or '').strip()!=originals[key].strip():raise ValueError(f'A escala foi modificada após o download ({label}, {name}). Baixe novamente antes de importar.')
     changes.append((names[name],d,new,actual))
  if seen!=set(allowed):raise ValueError('O arquivo precisa manter todas as datas do mês.')
  return changes
@@ -783,13 +786,14 @@ elif page=='Escalas':
      flash('Alteração salva automaticamente no GitHub!')
    # A importação aplica somente diferenças entre o arquivo exportado e a versão salva.
    with st.expander('Importar Excel editado'):
+    st.caption('Você pode reorganizar ou omitir colunas de colaboradores e deixar dias sem escala em branco. Colunas omitidas não excluem colaboradores da escala.')
     uploaded=st.file_uploader('Envie o Excel exportado desta escala após editar os horários, folgas ou coberturas',type=['xlsx'],key=f'v12_excel_{rid}')
     if uploaded is not None:
      try:
       changes_excel=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
       if not changes_excel:st.info('Nenhuma alteração encontrada no Excel.')
       else:
-       st.write(f'{len(changes_excel)} célula(s) alterada(s)')
+       st.write(f'{len(changes_excel)} célula(s) alterada(s). Colaboradores omitidos no Excel permanecem na escala salva.')
        st.dataframe(pd.DataFrame([{'Data':fmt(d),'Colaborador':p['name'],'Anterior':old,'Novo':new} for p,d,new,old in changes_excel]),hide_index=True,use_container_width=True)
        if st.button('Confirmar importação e salvar no GitHub',type='primary',key=f'v12_import_{rid}'):
         def apply_excel():
