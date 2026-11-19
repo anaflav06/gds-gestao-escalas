@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v12.3 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v12.6 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -852,7 +852,8 @@ elif page=='Escalas':
     for p in group:line[p['name']]=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
     display.append(line)
    df=pd.DataFrame(display)
-   st.info('Edite a célula com um horário (ex.: 10:00–18:20), FOLGA ou COBRE: NOME DO COLABORADOR. Horários alterados continuam nos dias seguintes; folgas e coberturas são pontuais.')
+   st.info('Edite diretamente a célula: HH:MM–HH:MM, FOLGA ou COBRE: NOME COMPLETO. Você escolhe se o novo horário vale somente naquele dia ou nos próximos dias.')
+   edit_scope=st.radio('Ao alterar um horário:', ['Somente o dia editado', 'A partir da data (dias de trabalho seguintes)'],horizontal=True,key=f'v126_scope_{rid}',help='Folgas e coberturas são sempre pontuais. Uma alteração em uma folga poderá transformá-la em dia trabalhado.')
    editor_key=f'v11_grid_{rid}_{year}_{month}'
    # Reconstruir o widget apenas depois de uma gravação confirmada.
    revision=st.session_state.get(f'v11_revision_{rid}',0)
@@ -877,15 +878,23 @@ elif page=='Escalas':
         h1,m1,h2,m2=map(int,match.groups())
         if max(h1,h2)>23 or max(m1,m2)>59:raise ValueError('Horário inválido: '+new)
         value=f'{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}'
-        # Alterações de horário são válidas a partir do dia escolhido até o fim do mês.
-        # Não substitui alterações explícitas futuras já existentes (pontos de mudança).
-        prior=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
-        for future in days:
-         if future<d:continue
-         existing=saved.get((p['id'],future.isoformat()),current(p,future,exceptions))
-         if future>d and existing!=prior:break
-         if future.weekday() in off_days(p) or is_off(existing):continue
-         updates[(p['id'],future.isoformat())]=value
+        # A célula explicitamente editada SEMPRE prevalece, inclusive em domingos,
+        # feriados e dias previamente registrados como FOLGA.
+        updates[(p['id'],d.isoformat())]=value
+        if edit_scope=='A partir da data (dias de trabalho seguintes)':
+         # Propaga somente pelos dias normalmente trabalhados, preservando
+         # folgas, coberturas, férias e pontos de mudança futuros.
+         # O valor do dia editado não pode servir como filtro para bloquear
+         # a edição quando ele era FOLGA.
+         baseline=None
+         for future in days:
+          if future<=d:continue
+          existing=saved.get((p['id'],future.isoformat()),current(p,future,exceptions))
+          if is_off(existing) or future.weekday() in off_days(p):continue
+          if ' | ' in str(existing):break
+          if baseline is None:baseline=existing
+          elif existing!=baseline:break
+          updates[(p['id'],future.isoformat())]=value
        elif normalized.startswith('COBRE:'):
         target_name=normalize_name(new.split(':',1)[1])
         target=next((q for q in group if normalize_name(q['name'])==target_name and q['id']!=p['id']),None)
@@ -904,7 +913,7 @@ elif page=='Escalas':
       c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(now,rid))
     if persist_change(apply_grid_changes):
      st.session_state[f'v11_revision_{rid}']=revision+1
-     flash('Alteração salva automaticamente no GitHub!')
+     flash('Alteração confirmada e salva no GitHub!')
    # A importação aplica somente diferenças entre o arquivo exportado e a versão salva.
    with st.expander('Importar Excel editado'):
     st.caption('Você pode reorganizar ou omitir colunas de colaboradores e deixar dias sem escala em branco. Colunas omitidas não excluem colaboradores da escala.')
