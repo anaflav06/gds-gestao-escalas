@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v10.1 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v11 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -495,7 +495,7 @@ login()
 with st.sidebar:
  st.markdown(f'<div style="text-align:center;padding:14px 8px;margin-bottom:12px;background:#242424;border-radius:12px"><img src="data:image/png;base64,{LOGO_B64}" style="width:160px;max-width:90%"/></div>',unsafe_allow_html=True)
  st.markdown('**GESTÃO DE ESCALAS**')
- page=st.radio('Navegação',['Visão geral','Importar planilha','Escalas','Escalas personalizadas','Folgas','Colaboradores','Feriados','Ações em massa','Histórico'],label_visibility='collapsed')
+ page=st.radio('Navegação',['Escalas','Importar planilha','Colaboradores','Folgas','Mais opções'],label_visibility='collapsed')
  st.divider()
  if st.button('Sair',use_container_width=True):st.session_state.authorized=False;st.rerun()
 
@@ -532,6 +532,9 @@ def action_editor(key,people,day,selected):
 def validate_value(value):
  if value.startswith(('FOLGA','FÉRIAS','ATESTADO','AFASTAMENTO')):return True
  return bool(re.match(r'^\d{2}:\d{2}[–-]\d{2}:\d{2}( \| .+)?$',value))
+
+if page=='Mais opções':
+ page=st.selectbox('Ferramentas adicionais',['Visão geral','Feriados','Ações em massa','Histórico'],key='v11_tools')
 
 if page=='Visão geral':
  st.title('Visão geral')
@@ -573,147 +576,136 @@ elif page=='Importar planilha':
 
 elif page=='Escalas':
  st.title('Escalas')
- departments=st.multiselect('Departamentos (selecione um ou mais)',TEAMS,default=TEAMS[:1],key='scale_departments')
- team=' + '.join(departments) or 'Sem departamento'
- year,month=month_filters('scale')
- group=sort_team([p for p in active if p['team'] in departments])
- days=month_days(year,month)
- if group:
-  data=[]
-  for d in days:
-   rec={'Data':fmt(d),'Dia':WEEK[d.weekday()]+(' • Feriado' if d.isoformat() in holidays else '')}
-   for p in group:rec[p['name']]=current(p,d,exceptions)
-   data.append(rec)
-  df=pd.DataFrame(data)
-  def paint(row):
-   d=days[row.name];base='#ffead2' if d.isoformat() in holidays else '#e9f2fa' if d.weekday()>=5 else '#ffffff' if row.name%2 else '#f5f6f8'
-   return [f'background-color:{"#c5e9b9" if is_off(str(v)) else base};color:#1b1b1b' for v in row]
-  leader_cols=[p['name'] for p in group if 'Líder' in p['role'] or 'Lider' in p['role']]
-  styler=df.style.apply(paint,axis=1)
-  # Streamlit may render grid headers without Styler header CSS; use a compact leader legend as fallback.
-  if leader_cols:
-   st.markdown('**<span style="color:#174ea6">Líderes:</span>** '+', '.join(leader_cols),unsafe_allow_html=True)
-  st.dataframe(styler,use_container_width=True,hide_index=True,height=570)
-  a,b=st.columns(2)
-  a.download_button('⬇️ Baixar Excel',excel_bytes(df),file_name=f'escala_{team}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
-  b.download_button('🖨️ Imprimir PDF A4 paisagem',render_pdf(team,group,days,exceptions,holidays,year,month),file_name=f'escala_{team}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
-  st.subheader('Editar um dia')
-  a,b=st.columns(2)
-  with a:p=person_select('Colaborador',group,'single_person')
-  with b:d=date_field('Data',date(year,month,min(date.today().day,len(days))),'single_day')
-  st.caption('Atual: '+current(p,d,exceptions))
-  with st.container(border=True):
-   value=action_editor('single',group,d,p)
-   reason=st.text_input('Observação (opcional)')
-   if st.button('Salvar alteração',type='primary',use_container_width=True):
-    if not validate_value(value):st.error('Informe o horário no formato HH:MM–HH:MM.')
-    else:
-     items=[(p['id'],d,value)]
-     if ' | COBRE FOLGA DE ' in value:
-      covered_name=value.split(' | COBRE FOLGA DE ',1)[1]
-      covered=next((q for q in group if q['name']==covered_name),None)
-      if not covered:st.error('Selecione o colaborador coberto antes de salvar.');st.stop()
-      previous=current(covered,d,exceptions)
-      if not is_off(previous) and (covered['id'],d.isoformat()) in exceptions:
-       st.error('O colaborador coberto já tem alteração nessa data. Revise antes de substituir.');st.stop()
-      items.append((covered['id'],d,'FOLGA | COBERTO POR '+p['name']))
-     if save_batch(items,reason,people,exceptions):flash(f'Alteração de {p["name"]} em {fmt(d)} salva com sucesso!')
-  if st.button('Restaurar horário/folga padrão nessa data'):
-   def restore():
-    with connect() as c:
-     c.execute('DELETE FROM exceptions WHERE person_id=? AND day=?',(p['id'],d.isoformat()))
-     c.execute('INSERT INTO audit(person_id,day,old_value,new_value,reason,changed_at) VALUES(?,?,?,?,?,?)',(p['id'],d.isoformat(),current(p,d,exceptions),planned(p,d),'Padrão restaurado',datetime.now().isoformat(timespec='seconds')))
-   if persist_change(restore):flash('Padrão restaurado e tabela atualizada.')
- else:st.info('Não há colaboradores ativos nessa equipe.')
-
-elif page=='Escalas personalizadas':
- st.title('Escalas personalizadas')
- st.caption('Monte escalas com vários departamentos, dê um título e mantenha as alterações salvas. Na próxima importação, somente os inativos serão retirados da composição.')
+ st.caption('Crie, edite e consulte suas escalas em uma única tela. Cada alteração da tabela é salva automaticamente no GitHub.')
  rosters=query('SELECT * FROM custom_rosters ORDER BY updated_at DESC,id DESC')
- options=['➕ Criar nova escala']+[f"{r['title']} · {MONTHS[r['month']-1]}/{r['year']} · #{r['id']}" for r in rosters]
- choice=st.selectbox('Selecionar escala salva ou criar nova',options,key='roster_choice')
- selected=None if choice==options[0] else rosters[options.index(choice)-1]
- if selected is None:
-  title=st.text_input('Título da escala',placeholder='Ex.: Operação VCP + Motoristas — Novembro',key='new_roster_title')
-  departments=st.multiselect('Departamentos',TEAMS,key='new_roster_depts')
-  year,month=month_filters('new_roster')
-  members=sort_team([p for p in active if p['team'] in departments])
-  st.caption(f'{len(members)} colaboradores ativos encontrados nos departamentos selecionados.')
-  if members:
-   chosen=st.multiselect('Colaboradores que farão parte da escala',members,default=members,format_func=lambda p:p['name']+' · '+p['team'],key='new_roster_members')
-  else:chosen=[]
-  if st.button('💾 Criar e salvar escala personalizada',type='primary',use_container_width=True):
-   if not title.strip():st.error('Informe um título para identificar a escala.')
-   elif not departments or not chosen:st.error('Selecione pelo menos um departamento e um colaborador.')
+ roster_ids=[r['id'] for r in rosters]
+ last=st.session_state.get('v11_last_roster')
+ if last not in roster_ids: last=roster_ids[0] if roster_ids else None
+ choices=[None]+roster_ids
+ chosen_id=st.selectbox('Escala',choices,index=choices.index(last),format_func=lambda rid:'➕ Nova escala' if rid is None else next(f"{r['title']} · {MONTHS[r['month']-1]}/{r['year']}" for r in rosters if r['id']==rid),key='v11_roster_select')
+ if chosen_id is None:
+  st.subheader('Montar nova escala')
+  title=st.text_input('Título da escala',placeholder='Ex.: Campinas — Operação e Motoristas',key='v11_new_title')
+  departments=st.multiselect('Departamentos',TEAMS,key='v11_new_departments')
+  pool=sort_team([p for p in active if p['team'] in departments])
+  # A escolha individual é feita antes de criar a escala.
+  picked=st.multiselect('Colaboradores (marque os que deseja incluir)',[p['id'] for p in pool],default=[p['id'] for p in pool],format_func=lambda pid:next(p['name'] for p in pool if p['id']==pid),key='v11_new_people') if pool else []
+  year,month=month_filters('v11_new')
+  if st.button('Criar escala',type='primary',use_container_width=True):
+   if not title.strip() or not picked:st.warning('Informe o título e selecione pelo menos um colaborador.')
    else:
-    def create_roster():
+    def create():
      now=datetime.now().isoformat(timespec='seconds')
      with connect() as c:
       cur=c.execute('INSERT INTO custom_rosters(title,year,month,departments,created_at,updated_at) VALUES(?,?,?,?,?,?)',(title.strip(),year,month,json.dumps(departments,ensure_ascii=False),now,now))
       rid=cur.lastrowid
-      c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,p['id']) for p in chosen])
-      # Congela a composição e os horários atuais do mês. Edições futuras não sobrescrevem o salvo.
+      c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,pid) for pid in picked])
+      chosen=[p for p in pool if p['id'] in picked]
       c.executemany('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?)',[(rid,p['id'],d.isoformat(),current(p,d,exceptions)) for p in chosen for d in month_days(year,month)])
-    if persist_change(create_roster):
-     st.session_state.pop('roster_choice',None)
-     flash('Escala personalizada criada e salva com sucesso!')
+      st.session_state['v11_created_id']=rid
+    if persist_change(create):
+     st.session_state['v11_last_roster']=st.session_state.pop('v11_created_id')
+     st.session_state.pop('v11_roster_select',None)
+     flash('Escala criada e salva com sucesso!')
  else:
-  rid=selected['id'];year=selected['year'];month=selected['month'];days=month_days(year,month)
+  roster=next(r for r in rosters if r['id']==chosen_id)
+  rid=roster['id'];year=roster['year'];month=roster['month'];days=month_days(year,month)
+  st.session_state['v11_last_roster']=rid
   member_ids={r['person_id'] for r in query('SELECT person_id FROM custom_roster_members WHERE roster_id=?',(rid,))}
-  group=sort_team([p for p in active if p['id'] in member_ids])
   saved={(r['person_id'],r['day']):r['value'] for r in query('SELECT person_id,day,value FROM custom_roster_days WHERE roster_id=?',(rid,))}
-  st.subheader(selected['title'])
-  st.caption(f'{MONTHS[month-1]}/{year} · {len(group)} colaboradores ativos · edição independente da escala geral')
-  with st.expander('✏️ Alterar título e colaboradores desta escala'):
-   newtitle=st.text_input('Título',value=selected['title'],key=f'roster_title_{rid}')
-   deptchoices=st.multiselect('Departamentos',TEAMS,default=[t for t in json.loads(selected['departments']) if t in TEAMS],key=f'roster_depts_{rid}')
-   pool=sort_team([p for p in active if p['team'] in deptchoices])
-   selected_people=st.multiselect('Colaboradores',pool,default=[p for p in pool if p['id'] in member_ids],format_func=lambda p:p['name']+' · '+p['team'],key=f'roster_members_{rid}')
-   if st.button('Salvar título e composição',type='primary',key=f'roster_save_members_{rid}'):
-    if not newtitle.strip() or not selected_people:st.error('Informe um título e selecione colaboradores.')
+  try: existing_depts=json.loads(roster['departments'])
+  except (TypeError,ValueError):existing_depts=[]
+  with st.expander('Título, departamentos e colaboradores',expanded=False):
+   edited_title=st.text_input('Título',value=roster['title'],key=f'v11_title_{rid}')
+   selected_depts=st.multiselect('Departamentos (um ou mais)',TEAMS,default=[d for d in existing_depts if d in TEAMS],key=f'v11_depts_{rid}')
+   available=sort_team([p for p in active if p['team'] in selected_depts])
+   options=[p['id'] for p in available]
+   defaults=[pid for pid in options if pid in member_ids]
+   selected_ids=st.multiselect('Colaboradores — selecione quem participa',options,default=defaults,format_func=lambda pid:next(p['name'] for p in available if p['id']==pid),key=f'v11_members_{rid}')
+   st.caption('Todos os colaboradores ativos dos departamentos selecionados ficam disponíveis para marcar ou desmarcar.')
+   if st.button('Atualizar composição',type='primary',key=f'v11_composition_{rid}'):
+    if not edited_title.strip() or not selected_ids:st.warning('Informe um título e escolha pelo menos um colaborador.')
     else:
-     def change_roster():
+     def update_composition():
+      now=datetime.now().isoformat(timespec='seconds')
       with connect() as c:
-       c.execute('UPDATE custom_rosters SET title=?,departments=?,updated_at=? WHERE id=?',(newtitle.strip(),json.dumps(deptchoices,ensure_ascii=False),datetime.now().isoformat(timespec='seconds'),rid))
+       c.execute('UPDATE custom_rosters SET title=?,departments=?,updated_at=? WHERE id=?',(edited_title.strip(),json.dumps(selected_depts,ensure_ascii=False),now,rid))
        c.execute('DELETE FROM custom_roster_members WHERE roster_id=?',(rid,))
-       c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,p['id']) for p in selected_people])
-       c.executemany('INSERT OR IGNORE INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?)',[(rid,p['id'],d.isoformat(),current(p,d,exceptions)) for p in selected_people for d in days])
-     if persist_change(change_roster):flash('Título e colaboradores salvos com sucesso!')
-  if group:
-   data=[]
+       c.executemany('INSERT INTO custom_roster_members(roster_id,person_id) VALUES(?,?)',[(rid,pid) for pid in selected_ids])
+       c.executemany('INSERT OR IGNORE INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?)',[(rid,p['id'],d.isoformat(),current(p,d,exceptions)) for p in available if p['id'] in selected_ids for d in days])
+     if persist_change(update_composition):flash('Composição salva com sucesso!')
+  group=[p for p in active if p['id'] in member_ids]
+  # Classifica pelo horário efetivo mais cedo na escala, sem depender da ordem de cadastro.
+  group.sort(key=lambda p:(min((start_minutes(saved.get((p['id'],d.isoformat()),current(p,d,exceptions))) for d in days if not is_off(saved.get((p['id'],d.isoformat()),current(p,d,exceptions)))),default=9999),normalize_name(p['name'])))
+  st.subheader(roster['title'])
+  st.caption(f'{MONTHS[month-1]}/{year} · {len(group)} colaboradores · Clique duas vezes em uma célula para editar')
+  if not group:st.info('Esta escala não tem colaboradores ativos. Abra “Título, departamentos e colaboradores” para selecionar.')
+  else:
+   display=[]
    for d in days:
-    rec={'Data':fmt(d),'Dia':WEEK[d.weekday()]}
-    for p in group:rec[p['name']]=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
-    data.append(rec)
-   df=pd.DataFrame(data)
-   st.dataframe(df,use_container_width=True,hide_index=True,height=560)
-   st.download_button('⬇️ Exportar Excel da escala personalizada',excel_bytes(df),file_name=f'escala_personalizada_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-   custom_exceptions=dict(exceptions);custom_exceptions.update(saved)
-   st.download_button('🖨️ Exportar PDF da escala personalizada',render_pdf(selected['title'],group,days,custom_exceptions,holidays,year,month),file_name=f'escala_personalizada_{rid}_{year}_{month:02d}.pdf',mime='application/pdf')
-   st.subheader('Editar data e horário da escala personalizada')
-   a,b=st.columns(2)
-   with a:person=person_select('Colaborador',group,f'roster_person_{rid}')
-   with b:day=date_field('Data',days[0],f'roster_day_{rid}')
-   if day.year!=year or day.month!=month:st.warning('Selecione uma data dentro do mês da escala.')
-   else:
-    effective=saved.get((person['id'],day.isoformat()),current(person,day,exceptions))
-    st.caption('Horário salvo: '+effective)
-    # Campo sempre editável, inclusive em horários alternados e folgas.
-    identity=f'{rid}:{person["id"]}:{day.isoformat()}'
-    if st.session_state.get('roster_edit_identity')!=identity:
-     st.session_state['roster_edit_value']=effective
-     st.session_state['roster_edit_identity']=identity
-    value=st.text_input('Horário ou situação (ex.: 14:00–22:20 ou FOLGA)',key='roster_edit_value')
-    if st.button('Salvar alteração desta data',type='primary',key=f'roster_save_day_{rid}'):
-     if not value.strip():st.error('Preencha o horário ou a situação.')
-     else:
-      def change_day():
-       with connect() as c:
-        c.execute('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?) ON CONFLICT(roster_id,person_id,day) DO UPDATE SET value=excluded.value',(rid,person['id'],day.isoformat(),value.strip()))
-        c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(datetime.now().isoformat(timespec='seconds'),rid))
-      if persist_change(change_day):flash('Alteração da escala personalizada salva com sucesso!')
-  else:st.info('Nenhum colaborador ativo nesta escala. Edite a composição ou importe uma nova planilha.')
-
+    line={'Data':fmt(d),'Dia':WEEK[d.weekday()]+(' • Feriado' if d.isoformat() in holidays else '')}
+    for p in group:line[p['name']]=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
+    display.append(line)
+   df=pd.DataFrame(display)
+   st.info('Edite a célula com um horário (ex.: 10:00–18:20), FOLGA ou COBRE: NOME DO COLABORADOR. Horários alterados continuam nos dias seguintes; folgas e coberturas são pontuais.')
+   editor_key=f'v11_grid_{rid}_{year}_{month}'
+   # Reconstruir o widget apenas depois de uma gravação confirmada.
+   revision=st.session_state.get(f'v11_revision_{rid}',0)
+   editor_key+=f'_{revision}'
+   edited=st.data_editor(df,key=editor_key,hide_index=True,use_container_width=True,height=600,num_rows='fixed',disabled=['Data','Dia'],column_config={'Data':st.column_config.TextColumn('Data',width='small'),'Dia':st.column_config.TextColumn('Dia',width='medium')})
+   changed=[]
+   for i,d in enumerate(days):
+    for p in group:
+     name=p['name'];old=str(df.at[i,name]);new=str(edited.at[i,name]).strip()
+     if new!=old:changed.append((p,d,new))
+   if changed:
+    # Uma única transação remota por edição, evitando sobrescrever alterações de outras sessões.
+    def apply_grid_changes():
+     now=datetime.now().isoformat(timespec='seconds')
+     with connect() as c:
+      updates={}
+      for p,d,new in changed:
+       if not new:raise ValueError('A célula não pode ficar vazia. Use FOLGA ou um horário.')
+       normalized=new.upper().strip()
+       match=re.fullmatch(r'(\d{1,2}):(\d{2})\s*[–-]\s*(\d{1,2}):(\d{2})',normalized)
+       if match:
+        h1,m1,h2,m2=map(int,match.groups())
+        if max(h1,h2)>23 or max(m1,m2)>59:raise ValueError('Horário inválido: '+new)
+        value=f'{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}'
+        # Alterações de horário são válidas a partir do dia escolhido até o fim do mês.
+        # Não substitui alterações explícitas futuras já existentes (pontos de mudança).
+        prior=saved.get((p['id'],d.isoformat()),current(p,d,exceptions))
+        for future in days:
+         if future<d:continue
+         existing=saved.get((p['id'],future.isoformat()),current(p,future,exceptions))
+         if future>d and existing!=prior:break
+         if future.weekday() in off_days(p) or is_off(existing):continue
+         updates[(p['id'],future.isoformat())]=value
+       elif normalized.startswith('COBRE:'):
+        target_name=normalize_name(new.split(':',1)[1])
+        target=next((q for q in group if normalize_name(q['name'])==target_name and q['id']!=p['id']),None)
+        if not target:raise ValueError('Cobertura: digite o nome completo de outro colaborador presente nesta escala.')
+        target_old=saved.get((target['id'],d.isoformat()),current(target,d,exceptions))
+        cover_hours=target_old.split(' | ')[0]
+        if is_off(cover_hours) or not validate_value(cover_hours):raise ValueError('O colaborador coberto precisa ter horário de trabalho nessa data.')
+        updates[(p['id'],d.isoformat())]=cover_hours+' | COBRE FOLGA DE '+target['name']
+        updates[(target['id'],d.isoformat())]='FOLGA | COBERTO POR '+p['name']
+       elif normalized in ('FOLGA','FOLGA FERIADO','FÉRIAS','ATESTADO','AFASTAMENTO'):
+        updates[(p['id'],d.isoformat())]=normalized
+       elif validate_value(new):
+        updates[(p['id'],d.isoformat())]=new
+       else:raise ValueError('Use HH:MM–HH:MM, FOLGA, FOLGA FERIADO ou COBRE: NOME COMPLETO.')
+      c.executemany('INSERT INTO custom_roster_days(roster_id,person_id,day,value) VALUES(?,?,?,?) ON CONFLICT(roster_id,person_id,day) DO UPDATE SET value=excluded.value',[(rid,pid,day,value) for (pid,day),value in updates.items()])
+      c.execute('UPDATE custom_rosters SET updated_at=? WHERE id=?',(now,rid))
+    if persist_change(apply_grid_changes):
+     st.session_state[f'v11_revision_{rid}']=revision+1
+     flash('Alteração salva automaticamente no GitHub!')
+   with st.expander('Exportar escala'):
+    a,b=st.columns(2)
+    with a:st.download_button('Baixar Excel',excel_bytes(df),file_name=f'escala_{rid}_{year}_{month:02d}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+    with b:
+     pdf_values=dict(exceptions);pdf_values.update(saved)
+     st.download_button('Baixar PDF',render_pdf(roster['title'],group,days,pdf_values,holidays,year,month),file_name=f'escala_{rid}_{year}_{month:02d}.pdf',mime='application/pdf',use_container_width=True)
 elif page=='Ações em massa':
  st.title('Ações em massa')
  team=st.selectbox('Departamento',TEAMS,key='bulk_team') if TEAMS else None
