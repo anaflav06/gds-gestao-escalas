@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v12.1 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v12.3 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -465,38 +465,55 @@ def render_pdf(team,people,days,exceptions,holidays,year,month):
  c.showPage();c.save();return buf.getvalue()
 
 def render_pdf_from_dataframe(title,df,year,month):
- from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,PageBreak,Spacer
+ """Exporta exatamente as células e a ordem da escala visível, sem recalcular turnos."""
+ from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,PageBreak,Spacer,KeepTogether
  from reportlab.lib.pagesizes import A3,landscape
- from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+ from reportlab.lib.styles import ParagraphStyle
  from reportlab.lib.colors import HexColor
  from reportlab.lib.enums import TA_CENTER
  from xml.sax.saxutils import escape
  buf=io.BytesIO(); page_w,page_h=landscape(A3)
- styles=getSampleStyleSheet()
- styles.add(ParagraphStyle(name='GDSCell',fontName='Helvetica',fontSize=6.8,leading=8.5,alignment=TA_CENTER,wordWrap='CJK'))
- styles.add(ParagraphStyle(name='GDSHeader',fontName='Helvetica-Bold',fontSize=7.3,leading=9,alignment=TA_CENTER,wordWrap='CJK'))
- doc=SimpleDocTemplate(buf,pagesize=(page_w,page_h),leftMargin=22,rightMargin=22,topMargin=30,bottomMargin=24)
- story=[];allcols=list(df.columns)
- # A largura mínima impede que horários e coberturas sejam truncados.
- for offset in range(2,len(allcols),7):
-  cols=allcols[:2]+allcols[offset:offset+7]
-  story.append(Paragraph(escape('ESCALA DE '+title.upper()),styles['Heading2']))
-  story.append(Paragraph(escape(f'{MONTHS[month-1].upper()} / {year} — Colaboradores {offset-1} a {min(offset+5,len(allcols)-2)}'),styles['Normal']))
-  story.append(Spacer(1,10))
-  data=[[Paragraph(escape(str(c)),styles['GDSHeader']) for c in cols]]
+ head=ParagraphStyle('gds_head',fontName='Helvetica-Bold',fontSize=8.3,leading=11.5,alignment=TA_CENTER,splitLongWords=True)
+ cell=ParagraphStyle('gds_cell',fontName='Helvetica',fontSize=7.4,leading=10,alignment=TA_CENTER)
+ title_style=ParagraphStyle('gds_title',fontName='Helvetica-Bold',fontSize=14,leading=18)
+ subtitle=ParagraphStyle('gds_subtitle',fontName='Helvetica',fontSize=9,leading=12)
+ doc=SimpleDocTemplate(buf,pagesize=(page_w,page_h),leftMargin=26,rightMargin=26,topMargin=25,bottomMargin=25)
+ cols_all=list(df.columns); names=cols_all[2:]
+ if not names:raise ValueError('A escala não possui colaboradores para exportar.')
+ # Distribuição equilibrada: para 15 pessoas, 3 páginas com 5, sem página isolada.
+ count=(len(names)+5)//6
+ per_page=(len(names)+count-1)//count
+ groups=[names[i:i+per_page] for i in range(0,len(names),per_page)]
+ story=[]
+ for page_no,people_cols in enumerate(groups,1):
+  if page_no>1:story.append(PageBreak())
+  cols=cols_all[:2]+people_cols
+  story.append(Paragraph(escape(title.upper()),title_style))
+  story.append(Paragraph(escape(f'{MONTHS[month-1].upper()} / {year}  |  Página {page_no} de {len(groups)}  |  Colaboradores {1+(page_no-1)*per_page} a {(page_no-1)*per_page+len(people_cols)}'),subtitle))
+  story.append(Spacer(1,12))
+  def h(v):
+   # Quebra por palavras: nome completo em 2–4 linhas legíveis.
+   words=escape(str(v)).split(' ')
+   lines=[];line=[]
+   for w in words:
+    if sum(map(len,line))+len(line)+len(w)>17 and line:
+     lines.append(' '.join(line));line=[]
+    line.append(w)
+   if line:lines.append(' '.join(line))
+   return Paragraph('<br/>'.join(lines),head)
+  data=[[h(c) for c in cols]]
   for _,row in df.iterrows():
-   data.append([Paragraph(escape(str(row[c]) if pd.notna(row[c]) else '').replace(' | ','<br/>'),styles['GDSCell']) for c in cols])
-  width=page_w-44
-  widths=[75,94]+[(width-169)/(len(cols)-2)]*(len(cols)-2)
+   data.append([Paragraph(escape('' if pd.isna(row[c]) else str(row[c])).replace(' | ','<br/>'),cell) for c in cols])
+  usable=page_w-52
+  widths=[74,100]+[(usable-174)/len(people_cols)]*len(people_cols)
   t=Table(data,colWidths=widths,repeatRows=1,hAlign='LEFT')
-  cmds=[('BACKGROUND',(0,0),(-1,0),HexColor('#303030')),('TEXTCOLOR',(0,0),(-1,0),HexColor('#ffffff')),('GRID',(0,0),(-1,-1),.35,HexColor('#bfc3c7')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4)]
+  cmds=[('BACKGROUND',(0,0),(-1,0),HexColor('#292929')),('TEXTCOLOR',(0,0),(-1,0),HexColor('#ffffff')),('GRID',(0,0),(-1,-1),.35,HexColor('#c5c8cc')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,0),8),('BOTTOMPADDING',(0,0),(-1,0),8),('TOPPADDING',(0,1),(-1,-1),4),('BOTTOMPADDING',(0,1),(-1,-1),4)]
   for i in range(1,len(data)):
-   if i%2==0:cmds.append(('BACKGROUND',(0,i),(-1,i),HexColor('#f2f3f5')))
-   if 'Feriado' in str(df.iloc[i-1]['Dia']):cmds.append(('BACKGROUND',(0,i),(1,i),HexColor('#ffe0bc')))
-   for j,c in enumerate(cols[2:],2):
-    if str(df.iloc[i-1][c]).upper().startswith('FOLGA'):cmds.append(('BACKGROUND',(j,i),(j,i),HexColor('#c9ebc2')))
+   if i%2==0:cmds.append(('BACKGROUND',(0,i),(-1,i),HexColor('#f3f4f6')))
+   if 'Feriado' in str(df.iloc[i-1]['Dia']):cmds.append(('BACKGROUND',(0,i),(1,i),HexColor('#ffe1be')))
+   for j,col in enumerate(people_cols,2):
+    if str(df.iloc[i-1][col]).strip().upper().startswith('FOLGA'):cmds.append(('BACKGROUND',(j,i),(j,i),HexColor('#c9ebc2')))
   t.setStyle(TableStyle(cmds));story.append(t)
-  if offset+7<len(allcols):story.append(PageBreak())
  doc.build(story)
  return buf.getvalue()
 
@@ -539,7 +556,7 @@ def parse_roster_excel(file,roster,group,days,saved,exceptions):
  # Colunas ausentes NÃO removem o colaborador da escala salva.
  unknown=[name for name in cols[2:] if name not in names]
  if unknown:raise ValueError('Colaborador(es) não encontrado(s) nesta escala: '+', '.join(unknown))
- allowed={fmt(d):d for d in days};changes=[];seen=set()
+ allowed={fmt(d):d for d in days};changes=[];conflicts=[];seen=set()
  for row in rows:
   if not any(v is not None for v in row):continue
   label=row[0]
@@ -555,10 +572,11 @@ def parse_roster_excel(file,roster,group,days,saved,exceptions):
     if new and not validate_value(new) and not re.fullmatch(r'COBRE:\s*.+',new,re.I):
      raise ValueError(f'Valor inválido em {label}, {name}: {new}')
     actual=saved.get((names[name]['id'],d.isoformat()),current(names[name],d,exceptions))
-    if str(actual or '').strip()!=originals[key].strip():raise ValueError(f'A escala foi modificada após o download ({label}, {name}). Baixe novamente antes de importar.')
-    changes.append((names[name],d,new,actual))
+    if str(actual or '').strip()!=originals[key].strip() and new!=str(actual or '').strip():
+     conflicts.append((names[name],d,originals[key],actual,new))
+    if new!=str(actual or '').strip():changes.append((names[name],d,new,actual))
  if seen!=set(allowed):raise ValueError('O arquivo precisa manter todas as datas do mês.')
- return changes,cols[2:]
+ return changes,cols[2:],conflicts
 
 def proposed_fixed_changes(group,days,saved):
  # Mais de uma semana = oito datas consecutivas de vigência de um mesmo horário.
@@ -831,12 +849,17 @@ elif page=='Escalas':
     uploaded=st.file_uploader('Envie o Excel exportado desta escala após editar os horários, folgas ou coberturas',type=['xlsx'],key=f'v12_excel_{rid}')
     if uploaded is not None:
      try:
-      changes_excel,excel_columns=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
+      changes_excel,excel_columns,conflicts_excel=parse_roster_excel(uploaded,roster,group,days,saved,exceptions)
       if not changes_excel:st.info('Nenhuma alteração de célula encontrada. A ordem e seleção das colunas podem ser importadas mesmo assim.')
       if True:
        st.write(f'{len(changes_excel)} célula(s) alterada(s). Colunas do Excel: {len(excel_columns)}. Colaboradores omitidos permanecem cadastrados, mas não aparecerão nesta versão da escala.')
        st.dataframe(pd.DataFrame([{'Data':fmt(d),'Colaborador':p['name'],'Anterior':old,'Novo':new} for p,d,new,old in changes_excel]),hide_index=True,use_container_width=True)
-       if st.button('Confirmar importação e salvar no GitHub',type='primary',key=f'v12_import_{rid}'):
+       allow_conflicts=True
+       if conflicts_excel:
+        st.warning(f'{len(conflicts_excel)} conflito(s): houve edição no aplicativo depois que o Excel foi baixado. Confira antes de decidir.')
+        st.dataframe(pd.DataFrame([{'Data':fmt(d),'Colaborador':p['name'],'No download':original,'Atual no app':actual,'No Excel':new} for p,d,original,actual,new in conflicts_excel]),hide_index=True,use_container_width=True)
+        allow_conflicts=st.checkbox('Confirmo que quero manter os valores do Excel nos conflitos acima',value=False,key=f'v123_confirm_{rid}')
+       if st.button('Confirmar importação e salvar no GitHub',type='primary',disabled=not allow_conflicts,key=f'v12_import_{rid}'):
         def apply_excel():
          now=datetime.now().isoformat(timespec='seconds');updates={}
          for p,d,new,old in changes_excel:
