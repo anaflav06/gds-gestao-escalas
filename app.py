@@ -1,4 +1,4 @@
-# APP GDS - Gestao de Escalas | v10 | GitHub persistente | correcao disk I/O
+# APP GDS - Gestao de Escalas | v10.1 | GitHub persistente | correcao disk I/O
 # Instalar: py -m pip install streamlit pandas openpyxl reportlab
 # Executar: py -m streamlit run app.py
 import base64
@@ -343,9 +343,9 @@ def import_staff(records,filename,total,warnings):
      c.execute('UPDATE people SET name=?,team=?,role=?,regular=?,offdays=?,pattern=?,active=?,external_id=?,source_department=?,raw_schedule=?,import_managed=1 WHERE id=?',
       (r['name'],r['team'],r['role'],r['regular'],r['offdays'],r['pattern'],r['active'],r['external_id'],r['team'],r['raw_schedule'],pid))
     else:
-     c.execute('INSERT INTO people(name,team,role,regular,offdays,pattern,active,external_id,source_department,raw_schedule,import_managed) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
+     cursor=c.execute('INSERT INTO people(name,team,role,regular,offdays,pattern,active,external_id,source_department,raw_schedule,import_managed) VALUES(?,?,?,?,?,?,?,?,?,?,1)',
       (r['name'],r['team'],r['role'],r['regular'],r['offdays'],r['pattern'],r['active'],r['external_id'],r['team'],r['raw_schedule']))
-     incoming_ids.add(c.lastrowid)
+     incoming_ids.add(cursor.lastrowid)
    # A ÚLTIMA planilha é a fonte oficial. Ausentes/inativos não aparecem na escala.
    if incoming_ids:
     placeholders=','.join('?' for _ in incoming_ids)
